@@ -6,22 +6,27 @@ import QRCode from "qrcode";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import { Boom } from "@hapi/boom";
-
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
   makeCacheableSignalKeyStore
 } from "@whiskeysockets/baileys";
-
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 
 const app = express();
 
 const PORT = Number(process.env.PORT || 3000);
 const API_TOKEN = process.env.API_TOKEN || "";
 const TZ = process.env.TZ || "America/Sao_Paulo";
+
+const ML_CLIENT_ID = process.env.ML_CLIENT_ID || "";
+const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || "";
+const ML_REDIRECT_URI =
+  process.env.ML_REDIRECT_URI ||
+  "https://ofertazap-api1.onrender.com/api/mercadolivre/callback";
 
 app.use(
   cors({
@@ -42,41 +47,25 @@ app.use(
 const DATA_DIR = path.resolve("./data");
 const AUTH_DIR = path.resolve("./auth_info_baileys");
 
-fs.mkdirSync(DATA_DIR, {
-  recursive: true
-});
-
-fs.mkdirSync(AUTH_DIR, {
-  recursive: true
-});
-
-// ======================================================
-// ARQUIVOS
-// ======================================================
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(AUTH_DIR, { recursive: true });
 
 const GROUPS_FILE = path.join(DATA_DIR, "groups.json");
 const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
+const ML_TOKEN_FILE = path.join(DATA_DIR, "mercadolivre.json");
 
 // ======================================================
-// FUNÇÕES DE ARQUIVO
+// JSON
 // ======================================================
 
 function loadJson(file, fallback = []) {
   try {
-    if (!fs.existsSync(file)) {
-      return fallback;
-    }
+    if (!fs.existsSync(file)) return fallback;
 
     return JSON.parse(
       fs.readFileSync(file, "utf8")
     );
-  } catch (err) {
-    console.error(
-      "Erro ao ler arquivo:",
-      file,
-      err.message
-    );
-
+  } catch {
     return fallback;
   }
 }
@@ -90,77 +79,523 @@ function saveJson(file, data) {
 }
 
 // ======================================================
-// ESTADO DO SISTEMA
+// ESTADO
 // ======================================================
 
-let groups = loadJson(
-  GROUPS_FILE,
-  []
-);
-
-let jobs = loadJson(
-  JOBS_FILE,
-  []
-);
+let groups = loadJson(GROUPS_FILE, []);
+let jobs = loadJson(JOBS_FILE, []);
 
 let sock = null;
-
 let qrDataUrl = null;
 
 let connectionState = "disconnected";
-
 let lastError = null;
 
+// Mercado Livre
+let mlOAuthState = null;
+let mlTokens = loadJson(
+  ML_TOKEN_FILE,
+  {}
+);
+
 // ======================================================
-// LIMPAR SESSÃO DO WHATSAPP
+// MERCADO LIVRE - CONFIGURAÇÃO
 // ======================================================
 
-function resetWhatsAppAuth() {
-  try {
-    if (fs.existsSync(AUTH_DIR)) {
-      for (const name of fs.readdirSync(AUTH_DIR)) {
-        fs.rmSync(
-          path.join(AUTH_DIR, name),
-          {
-            recursive: true,
-            force: true
-          }
-        );
-      }
-    }
-
-    qrDataUrl = null;
-
-    console.log(
-      "Sessão do WhatsApp limpa. Um novo QR será gerado."
+function requireMercadoLivreConfig() {
+  if (
+    !ML_CLIENT_ID ||
+    !ML_CLIENT_SECRET ||
+    !ML_REDIRECT_URI
+  ) {
+    throw new Error(
+      "Mercado Livre OAuth não configurado. Verifique ML_CLIENT_ID, ML_CLIENT_SECRET e ML_REDIRECT_URI no Render."
     );
-  } catch (err) {
-    lastError =
-      "Falha ao limpar sessão do WhatsApp: " +
-      err.message;
-
-    console.error(lastError);
   }
 }
+
+// ======================================================
+// MERCADO LIVRE - URL DE AUTORIZAÇÃO
+// ======================================================
+
+function buildMercadoLivreAuthUrl() {
+  requireMercadoLivreConfig();
+
+  mlOAuthState = crypto
+    .randomBytes(24)
+    .toString("hex");
+
+  const url = new URL(
+    "https://auth.mercadolivre.com.br/authorization"
+  );
+
+  url.searchParams.set(
+    "response_type",
+    "code"
+  );
+
+  url.searchParams.set(
+    "client_id",
+    ML_CLIENT_ID
+  );
+
+  url.searchParams.set(
+    "redirect_uri",
+    ML_REDIRECT_URI
+  );
+
+  url.searchParams.set(
+    "state",
+    mlOAuthState
+  );
+
+  url.searchParams.set(
+    "scope",
+    "offline_access read write"
+  );
+
+  return url.toString();
+}
+
+// ======================================================
+// MERCADO LIVRE - TROCAR CODE POR TOKEN
+// ======================================================
+
+async function exchangeMercadoLivreCode(code) {
+  requireMercadoLivreConfig();
+
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    client_id: ML_CLIENT_ID,
+    client_secret: ML_CLIENT_SECRET,
+    code,
+    redirect_uri: ML_REDIRECT_URI
+  });
+
+  const response = await fetch(
+    "https://api.mercadolibre.com/oauth/token",
+    {
+      method: "POST",
+
+      headers: {
+        accept: "application/json",
+        "content-type":
+          "application/x-www-form-urlencoded"
+      },
+
+      body
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.error_description ||
+        data.message ||
+        "Falha ao obter token do Mercado Livre"
+    );
+  }
+
+  mlTokens = {
+    ...data,
+    savedAt: new Date().toISOString()
+  };
+
+  saveJson(
+    ML_TOKEN_FILE,
+    mlTokens
+  );
+
+  return data;
+}
+
+// ======================================================
+// MERCADO LIVRE - RENOVAR TOKEN
+// ======================================================
+
+async function refreshMercadoLivreToken() {
+  requireMercadoLivreConfig();
+
+  if (!mlTokens.refresh_token) {
+    throw new Error(
+      "Mercado Livre ainda não foi autorizado. Conecte a conta primeiro."
+    );
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: ML_CLIENT_ID,
+    client_secret: ML_CLIENT_SECRET,
+    refresh_token: mlTokens.refresh_token
+  });
+
+  const response = await fetch(
+    "https://api.mercadolibre.com/oauth/token",
+    {
+      method: "POST",
+
+      headers: {
+        accept: "application/json",
+        "content-type":
+          "application/x-www-form-urlencoded"
+      },
+
+      body
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.error_description ||
+        data.message ||
+        "Falha ao renovar token do Mercado Livre"
+    );
+  }
+
+  mlTokens = {
+    ...data,
+    savedAt: new Date().toISOString()
+  };
+
+  saveJson(
+    ML_TOKEN_FILE,
+    mlTokens
+  );
+
+  return data;
+}
+
+// ======================================================
+// MERCADO LIVRE - ACCESS TOKEN
+// ======================================================
+
+async function getMercadoLivreAccessToken() {
+  if (!mlTokens.access_token) {
+    throw new Error(
+      "Mercado Livre não conectado. Autorize a conta primeiro."
+    );
+  }
+
+  const savedAt = new Date(
+    mlTokens.savedAt || 0
+  ).getTime();
+
+  const expiresAt =
+    savedAt +
+    Number(
+      mlTokens.expires_in || 21600
+    ) *
+      1000;
+
+  // Renova dois minutos antes de expirar
+  if (
+    Date.now() <
+    expiresAt - 120000
+  ) {
+    return mlTokens.access_token;
+  }
+
+  const refreshed =
+    await refreshMercadoLivreToken();
+
+  return refreshed.access_token;
+}
+
+// ======================================================
+// MERCADO LIVRE - PEGAR ID MLB
+// ======================================================
+
+function extractMercadoLivreItemId(value) {
+  const text = String(value || "");
+
+  const match = text.match(
+    /\b(MLB[-_]?\d{6,})\b/i
+  );
+
+  return match
+    ? match[1]
+        .replace(/[-_]/g, "")
+        .toUpperCase()
+    : null;
+}
+
+// ======================================================
+// RESOLVER LINK
+// ======================================================
+
+async function resolveMercadoLivreItemId(value) {
+  const direct =
+    extractMercadoLivreItemId(value);
+
+  if (direct) {
+    return direct;
+  }
+
+  const response = await fetch(
+    String(value),
+    {
+      redirect: "follow"
+    }
+  );
+
+  const finalUrl =
+    response.url ||
+    String(value);
+
+  const fromUrl =
+    extractMercadoLivreItemId(
+      finalUrl
+    );
+
+  if (fromUrl) {
+    return fromUrl;
+  }
+
+  const html =
+    await response.text();
+
+  return extractMercadoLivreItemId(
+    html
+  );
+}
+
+// ======================================================
+// MERCADO LIVRE - PRODUTO
+// ======================================================
+
+async function getMercadoLivreProduct(value) {
+  const itemId =
+    await resolveMercadoLivreItemId(
+      value
+    );
+
+  if (!itemId) {
+    throw new Error(
+      "Não consegui identificar o ID do anúncio (MLB) nesse link."
+    );
+  }
+
+  let token =
+    await getMercadoLivreAccessToken();
+
+  let response = await fetch(
+    `https://api.mercadolibre.com/items/${encodeURIComponent(
+      itemId
+    )}`,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    }
+  );
+
+  let data =
+    await response.json();
+
+  // Se token expirou
+  if (response.status === 401) {
+    const refreshed =
+      await refreshMercadoLivreToken();
+
+    token =
+      refreshed.access_token;
+
+    response = await fetch(
+      `https://api.mercadolibre.com/items/${encodeURIComponent(
+        itemId
+      )}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      }
+    );
+
+    data =
+      await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        data.message ||
+          data.error ||
+          "Falha ao consultar produto no Mercado Livre"
+      );
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      data.message ||
+        data.error ||
+        "Falha ao consultar produto no Mercado Livre"
+    );
+  }
+
+  const pictures =
+    Array.isArray(data.pictures)
+      ? data.pictures
+          .map(
+            p =>
+              p.secure_url ||
+              p.url
+          )
+          .filter(Boolean)
+      : [];
+
+  return {
+    id: data.id,
+
+    title:
+      data.title || "",
+
+    price:
+      data.price ?? null,
+
+    oldPrice:
+      data.original_price ?? null,
+
+    currency:
+      data.currency_id || "BRL",
+
+    image:
+      pictures[0] || null,
+
+    pictures,
+
+    permalink:
+      data.permalink || null
+  };
+}
+
+// ======================================================
+// OAUTH CALLBACK
+// ======================================================
+
+// Essa rota precisa ser pública.
+// O Mercado Livre redireciona o navegador para ela.
+
+app.get(
+  "/api/mercadolivre/callback",
+  async (req, res) => {
+    try {
+      const {
+        code,
+        state,
+        error,
+        error_description
+      } = req.query;
+
+      if (error) {
+        return res
+          .status(400)
+          .send(
+            `Autorização cancelada: ${
+              error_description ||
+              error
+            }`
+          );
+      }
+
+      if (!code) {
+        return res
+          .status(400)
+          .send(
+            "Código de autorização não recebido."
+          );
+      }
+
+      if (
+        !mlOAuthState ||
+        state !== mlOAuthState
+      ) {
+        return res
+          .status(400)
+          .send(
+            "Estado OAuth inválido ou expirado."
+          );
+      }
+
+      await exchangeMercadoLivreCode(
+        code
+      );
+
+      mlOAuthState = null;
+
+      res.send(`
+        <html>
+          <head>
+            <meta charset="UTF-8">
+            <title>OfertaZap</title>
+          </head>
+
+          <body style="
+            font-family:Arial;
+            text-align:center;
+            padding:50px;
+          ">
+
+            <h2>
+              OfertaZap conectado ao Mercado Livre ✅
+            </h2>
+
+            <p>
+              Sua conta foi autorizada com sucesso.
+            </p>
+
+            <p>
+              Você pode fechar esta página e voltar ao OfertaZap.
+            </p>
+
+          </body>
+        </html>
+      `);
+
+    } catch (err) {
+
+      res
+        .status(400)
+        .send(`
+          <h2>
+            Erro ao conectar Mercado Livre
+          </h2>
+
+          <p>
+            ${String(err.message)
+              .replace(/[<>]/g, "")}
+          </p>
+        `);
+    }
+  }
+);
 
 // ======================================================
 // AUTENTICAÇÃO DA API
 // ======================================================
 
-function authMiddleware(req, res, next) {
+function authMiddleware(
+  req,
+  res,
+  next
+) {
   if (!API_TOKEN) {
-    return res.status(503).json({
-      error:
-        "API_TOKEN não configurado no servidor"
-    });
+    return res
+      .status(503)
+      .json({
+        error:
+          "API_TOKEN não configurado no servidor"
+      });
   }
 
-  const authorization =
-    req.headers.authorization || "";
+  const auth =
+    req.headers.authorization ||
+    "";
 
   const bearer =
-    authorization.startsWith("Bearer ")
-      ? authorization.slice(7)
+    auth.startsWith("Bearer ")
+      ? auth.slice(7)
       : "";
 
   const token =
@@ -168,60 +603,210 @@ function authMiddleware(req, res, next) {
     req.headers["x-api-token"] ||
     "";
 
-  if (token !== API_TOKEN) {
-    return res.status(401).json({
-      error: "Token inválido"
-    });
+  if (
+    token !== API_TOKEN
+  ) {
+    return res
+      .status(401)
+      .json({
+        error:
+          "Token inválido"
+      });
   }
 
   next();
 }
 
 // ======================================================
-// ROTAS BÁSICAS
+// HOME
 // ======================================================
 
-app.get("/", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "OfertaZap API",
-    status: connectionState,
-    health: "/api/health"
-  });
-});
+app.get(
+  "/",
+  (_req, res) => {
+    res.json({
+      ok: true,
+      service:
+        "OfertaZap API",
+      status:
+        connectionState,
+      health:
+        "/api/health"
+    });
+  }
+);
 
 // ======================================================
 // HEALTH
 // ======================================================
 
-app.get("/api/health", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "OfertaZap API",
-    time: new Date().toISOString()
-  });
-});
+app.get(
+  "/api/health",
+  (_req, res) => {
+    res.json({
+      ok: true,
+      service:
+        "OfertaZap API",
+      time:
+        new Date().toISOString()
+    });
+  }
+);
 
-// Todas as outras rotas /api precisam do token
+// ======================================================
+// PROTEGER API
+// ======================================================
+
 app.use(
   "/api",
   authMiddleware
 );
 
 // ======================================================
+// MERCADO LIVRE - INICIAR AUTORIZAÇÃO
+// ======================================================
+
+app.get(
+  "/api/mercadolivre/auth",
+  (_req, res) => {
+    try {
+      const authorizationUrl =
+        buildMercadoLivreAuthUrl();
+
+      res.json({
+        ok: true,
+        authorizationUrl
+      });
+
+    } catch (err) {
+
+      res
+        .status(503)
+        .json({
+          error:
+            err.message
+        });
+    }
+  }
+);
+
+// ======================================================
+// MERCADO LIVRE - STATUS
+// ======================================================
+
+app.get(
+  "/api/mercadolivre/status",
+  (_req, res) => {
+
+    res.json({
+      ok: true,
+
+      configured:
+        Boolean(
+          ML_CLIENT_ID &&
+          ML_CLIENT_SECRET &&
+          ML_REDIRECT_URI
+        ),
+
+      connected:
+        Boolean(
+          mlTokens.access_token &&
+          mlTokens.refresh_token
+        ),
+
+      userId:
+        mlTokens.user_id ||
+        null,
+
+      expiresAt:
+        mlTokens.savedAt
+          ? new Date(
+              new Date(
+                mlTokens.savedAt
+              ).getTime() +
+                Number(
+                  mlTokens.expires_in ||
+                    21600
+                ) *
+                  1000
+            ).toISOString()
+          : null
+    });
+  }
+);
+
+// ======================================================
+// PRODUTO - PREVIEW
+// ======================================================
+
+app.post(
+  "/api/products/preview",
+  async (req, res) => {
+
+    try {
+
+      const {
+        link
+      } = req.body || {};
+
+      if (!link) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Informe o link do Mercado Livre"
+          });
+      }
+
+      const product =
+        await getMercadoLivreProduct(
+          link
+        );
+
+      res.json({
+        ok: true,
+        product
+      });
+
+    } catch (err) {
+
+      res
+        .status(400)
+        .json({
+          error:
+            err.message
+        });
+    }
+  }
+);
+
+// ======================================================
 // STATUS
 // ======================================================
 
-app.get("/api/status", (_req, res) => {
-  res.json({
-    ok: true,
-    whatsapp: connectionState,
-    qrAvailable: Boolean(qrDataUrl),
-    groups: groups.length,
-    jobs: jobs.length,
-    lastError
-  });
-});
+app.get(
+  "/api/status",
+  (_req, res) => {
+
+    res.json({
+      ok: true,
+
+      whatsapp:
+        connectionState,
+
+      qrAvailable:
+        Boolean(qrDataUrl),
+
+      groups:
+        groups.length,
+
+      jobs:
+        jobs.length,
+
+      lastError
+    });
+  }
+);
 
 // ======================================================
 // QR CODE
@@ -230,11 +815,14 @@ app.get("/api/status", (_req, res) => {
 app.get(
   "/api/whatsapp/qr",
   (_req, res) => {
+
     if (!qrDataUrl) {
-      return res.status(404).json({
-        error:
-          "QR Code ainda não disponível"
-      });
+      return res
+        .status(404)
+        .json({
+          error:
+            "QR Code ainda não disponível"
+        });
     }
 
     res.json({
@@ -245,348 +833,214 @@ app.get(
 );
 
 // ======================================================
-// INICIAR WHATSAPP
+// WHATSAPP
 // ======================================================
 
 async function startWhatsApp() {
+
   if (
-    connectionState === "connecting" ||
-    connectionState === "connected"
+    connectionState ===
+      "connecting" ||
+    connectionState ===
+      "connected"
   ) {
     return;
   }
 
-  connectionState = "connecting";
-  qrDataUrl = null;
+  connectionState =
+    "connecting";
+
   lastError = null;
 
-  try {
-    const {
-      state,
-      saveCreds
-    } = await useMultiFileAuthState(
+  const {
+    state,
+    saveCreds
+  } =
+    await useMultiFileAuthState(
       AUTH_DIR
     );
 
-    let version;
+  const {
+    version
+  } =
+    await fetchLatestBaileysVersion();
 
-    try {
-      const latest =
-        await fetchLatestBaileysVersion();
+  sock =
+    makeWASocket({
+      version,
 
-      version = latest.version;
-
-      console.log(
-        "Versão Baileys/WhatsApp:",
-        version.join(".")
-      );
-    } catch (err) {
-      console.warn(
-        "Não foi possível obter a versão mais recente. Usando a versão padrão do pacote."
-      );
-    }
-
-    const socketOptions = {
-      logger: pino({
-        level: "silent"
-      }),
+      logger:
+        pino({
+          level:
+            "silent"
+        }),
 
       auth: {
-        creds: state.creds,
+        creds:
+          state.creds,
 
         keys:
           makeCacheableSignalKeyStore(
             state.keys,
             pino({
-              level: "silent"
+              level:
+                "silent"
             })
           )
       },
 
-      printQRInTerminal: false,
+      printQRInTerminal:
+        false,
 
       browser: [
         "OfertaZap",
         "Chrome",
         "1.0.0"
-      ],
+      ]
+    });
 
-      generateHighQualityLinkPreview:
-        false
-    };
+  sock.ev.on(
+    "creds.update",
+    saveCreds
+  );
 
-    if (version) {
-      socketOptions.version = version;
-    }
+  sock.ev.on(
+    "connection.update",
+    async ({
+      connection,
+      lastDisconnect,
+      qr
+    }) => {
 
-    sock =
-      makeWASocket(
-        socketOptions
-      );
+      if (qr) {
 
-    sock.ev.on(
-      "creds.update",
-      saveCreds
-    );
+        qrDataUrl =
+          await QRCode.toDataURL(
+            qr
+          );
+      }
 
-    sock.ev.on(
-      "connection.update",
-      async ({
-        connection,
-        lastDisconnect,
-        qr
-      }) => {
-        try {
-          // ==========================================
-          // QR RECEBIDO
-          // ==========================================
+      if (
+        connection ===
+        "open"
+      ) {
 
-          if (qr) {
-            console.log(
-              "QR recebido do WhatsApp."
-            );
+        connectionState =
+          "connected";
 
-            qrDataUrl =
-              await QRCode.toDataURL(
-                qr,
-                {
-                  width: 420,
-                  margin: 2
-                }
-              );
+        qrDataUrl =
+          null;
 
-            connectionState =
-              "connecting";
-          }
+        lastError =
+          null;
 
-          // ==========================================
-          // CONECTADO
-          // ==========================================
+        console.log(
+          "WhatsApp conectado."
+        );
+      }
 
-          if (
-            connection === "open"
-          ) {
-            connectionState =
-              "connected";
+      if (
+        connection ===
+        "close"
+      ) {
 
-            qrDataUrl = null;
-            lastError = null;
+        connectionState =
+          "disconnected";
 
-            console.log(
-              "WhatsApp conectado."
-            );
+        const code =
+          new Boom(
+            lastDisconnect?.error
+          )
+            ?.output
+            ?.statusCode;
 
-            return;
-          }
+        lastError =
+          String(
+            code ||
+              lastDisconnect
+                ?.error
+                ?.message ||
+              "Conexão encerrada"
+          );
 
-          // ==========================================
-          // DESCONECTADO
-          // ==========================================
+        if (
+          code !==
+          DisconnectReason.loggedOut
+        ) {
 
-          if (
-            connection === "close"
-          ) {
-            connectionState =
-              "disconnected";
-
-            const error =
-              lastDisconnect?.error;
-
-            const code =
-              new Boom(error)
-                ?.output
-                ?.statusCode;
-
-            const reason = String(
-              code ||
-                error?.message ||
-                "Conexão encerrada"
-            );
-
-            lastError = reason;
-
-            console.error(
-              "WhatsApp desconectado:",
-              reason
-            );
-
-            // ========================================
-            // LOGOUT / SESSÃO INVÁLIDA
-            // ========================================
-
-            if (
-              code ===
-                DisconnectReason.loggedOut ||
-              code === 401
-            ) {
-              console.log(
-                "Sessão anterior inválida/desconectada. Limpando credenciais..."
-              );
-
-              resetWhatsAppAuth();
-
-              setTimeout(() => {
-                startWhatsApp()
-                  .catch(err => {
+          setTimeout(
+            () =>
+              startWhatsApp()
+                .catch(
+                  err => {
                     lastError =
                       err.message;
 
                     connectionState =
                       "disconnected";
-
-                    console.error(
-                      "Erro ao reiniciar após logout:",
-                      err.message
-                    );
-                  });
-              }, 1500);
-
-              return;
-            }
-
-            // ========================================
-            // OUTRAS DESCONECTADAS
-            // ========================================
-
-            setTimeout(() => {
-              startWhatsApp()
-                .catch(err => {
-                  lastError =
-                    err.message;
-
-                  connectionState =
-                    "disconnected";
-
-                  console.error(
-                    "Erro ao reconectar:",
-                    err.message
-                  );
-                });
-            }, 5000);
-          }
-        } catch (err) {
-          lastError =
-            err.message;
-
-          console.error(
-            "connection.update:",
-            err.message
+                  }
+                ),
+            5000
           );
         }
       }
-    );
-  } catch (err) {
-    connectionState =
-      "disconnected";
-
-    lastError =
-      err.message;
-
-    console.error(
-      "Falha ao iniciar WhatsApp:",
-      err.message
-    );
-
-    throw err;
-  }
+    }
+  );
 }
 
 // ======================================================
-// START WHATSAPP
+// INICIAR WHATSAPP
 // ======================================================
 
 app.post(
   "/api/whatsapp/start",
   async (_req, res) => {
+
     try {
+
       await startWhatsApp();
 
-      // Pequena espera para tentar capturar o QR
-      await new Promise(
-        resolve =>
-          setTimeout(resolve, 500)
-      );
-
       res.json({
         ok: true,
-
         status:
           connectionState,
-
         qrAvailable:
-          Boolean(qrDataUrl),
-
-        message: qrDataUrl
-          ? "QR Code disponível"
-          : "WhatsApp iniciado. Aguardando QR ou reconexão."
+          Boolean(
+            qrDataUrl
+          )
       });
+
     } catch (err) {
+
       lastError =
         err.message;
 
       connectionState =
         "disconnected";
 
-      res.status(500).json({
-        error: err.message
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            err.message
+        });
     }
   }
 );
 
 // ======================================================
-// RESET WHATSAPP
-// ======================================================
-
-app.post(
-  "/api/whatsapp/reset",
-  async (_req, res) => {
-    try {
-      if (sock) {
-        try {
-          sock.end(
-            undefined
-          );
-        } catch {}
-
-        sock = null;
-      }
-
-      connectionState =
-        "disconnected";
-
-      lastError = null;
-
-      resetWhatsAppAuth();
-
-      res.json({
-        ok: true,
-
-        message:
-          "Sessão do WhatsApp limpa. Agora inicie o WhatsApp para gerar um novo QR."
-      });
-    } catch (err) {
-      lastError =
-        err.message;
-
-      res.status(500).json({
-        error: err.message
-      });
-    }
-  }
-);
-
-// ======================================================
-// EXTRAIR CÓDIGO DO LINK DO GRUPO
+// GRUPOS
 // ======================================================
 
 function extractInviteCode(
   value
 ) {
+
   const match =
-    String(value || "").match(
-      /chat\.whatsapp\.com\/([A-Za-z0-9_-]+)/i
-    );
+    String(value || "")
+      .match(
+        /chat\.whatsapp\.com\/([A-Za-z0-9_-]+)/i
+      );
 
   return (
     match?.[1] ||
@@ -594,13 +1048,10 @@ function extractInviteCode(
   );
 }
 
-// ======================================================
-// LISTAR GRUPOS
-// ======================================================
-
 app.get(
   "/api/groups",
   (_req, res) => {
+
     res.json({
       ok: true,
       groups
@@ -608,13 +1059,10 @@ app.get(
   }
 );
 
-// ======================================================
-// CADASTRAR GRUPO
-// ======================================================
-
 app.post(
   "/api/groups",
   async (req, res) => {
+
     const {
       name,
       inviteLink,
@@ -626,10 +1074,12 @@ app.post(
       !inviteLink &&
       !jid
     ) {
-      return res.status(400).json({
-        error:
-          "Informe name, inviteLink ou jid"
-      });
+      return res
+        .status(400)
+        .json({
+          error:
+            "Informe name, inviteLink ou jid"
+        });
     }
 
     let groupJid =
@@ -640,31 +1090,33 @@ app.post(
       "Grupo WhatsApp";
 
     try {
-      if (!sock) {
-        return res.status(409).json({
-          error:
-            "WhatsApp não está conectado"
-        });
-      }
 
-      // ==========================================
-      // USANDO LINK DE CONVITE
-      // ==========================================
+      if (!sock) {
+        return res
+          .status(409)
+          .json({
+            error:
+              "WhatsApp não está conectado"
+          });
+      }
 
       if (
         !groupJid &&
         inviteLink
       ) {
+
         const code =
           extractInviteCode(
             inviteLink
           );
 
         if (!code) {
-          return res.status(400).json({
-            error:
-              "Link de convite inválido"
-          });
+          return res
+            .status(400)
+            .json({
+              error:
+                "Link de convite inválido"
+            });
         }
 
         const info =
@@ -687,25 +1139,28 @@ app.post(
         } catch {}
       }
 
-      // ==========================================
-      // SALVAR GRUPO
-      // ==========================================
-
       const item = {
-        id: randomUUID(),
 
-        name: groupName,
+        id:
+          randomUUID(),
 
-        jid: groupJid,
+        name:
+          groupName,
+
+        jid:
+          groupJid,
 
         inviteLink:
-          inviteLink || null,
+          inviteLink ||
+          null,
 
         createdAt:
           new Date().toISOString()
       };
 
-      groups.push(item);
+      groups.push(
+        item
+      );
 
       saveJson(
         GROUPS_FILE,
@@ -716,21 +1171,27 @@ app.post(
         ok: true,
         group: item
       });
+
     } catch (err) {
-      res.status(400).json({
-        error: err.message
-      });
+
+      res
+        .status(400)
+        .json({
+          error:
+            err.message
+        });
     }
   }
 );
 
 // ======================================================
-// EXCLUIR GRUPO
+// DELETAR GRUPO
 // ======================================================
 
 app.delete(
   "/api/groups/:id",
   (req, res) => {
+
     const before =
       groups.length;
 
@@ -757,12 +1218,13 @@ app.delete(
 );
 
 // ======================================================
-// LISTAR AGENDAMENTOS
+// AGENDAMENTOS
 // ======================================================
 
 app.get(
   "/api/jobs",
   (_req, res) => {
+
     res.json({
       ok: true,
       jobs
@@ -777,55 +1239,46 @@ app.get(
 app.post(
   "/api/jobs",
   (req, res) => {
+
     const {
       groupId,
       message,
       scheduledAt,
-      repeat
-    } = req.body || {};
-
-    // ==========================================
-    // VALIDAÇÃO
-    // ==========================================
+      repeat = "unica",
+      imageUrl = null,
+      product = null
+    } =
+      req.body || {};
 
     if (
       !groupId ||
       !message ||
       !scheduledAt
     ) {
-      return res.status(400).json({
-        error:
-          "groupId, message e scheduledAt são obrigatórios"
-      });
+
+      return res
+        .status(400)
+        .json({
+          error:
+            "groupId, message e scheduledAt são obrigatórios"
+        });
     }
-
-    // ==========================================
-    // REPETIÇÃO
-    // ==========================================
-
-    const repeatType =
-      repeat || "unica";
-
-    const allowedRepeat = [
-      "unica",
-      "diaria",
-      "semanal"
-    ];
 
     if (
-      !allowedRepeat.includes(
-        repeatType
-      )
+      ![
+        "unica",
+        "diaria",
+        "semanal"
+      ].includes(repeat)
     ) {
-      return res.status(400).json({
-        error:
-          "Repetição inválida. Use unica, diaria ou semanal."
-      });
-    }
 
-    // ==========================================
-    // LOCALIZAR GRUPO
-    // ==========================================
+      return res
+        .status(400)
+        .json({
+          error:
+            "Repetição inválida. Use unica, diaria ou semanal."
+        });
+    }
 
     const group =
       groups.find(
@@ -835,38 +1288,19 @@ app.post(
       );
 
     if (!group) {
-      return res.status(404).json({
-        error:
-          "Grupo não encontrado"
-      });
+
+      return res
+        .status(404)
+        .json({
+          error:
+            "Grupo não encontrado"
+        });
     }
-
-    // ==========================================
-    // VALIDAR DATA
-    // ==========================================
-
-    const date =
-      new Date(
-        scheduledAt
-      );
-
-    if (
-      !Number.isFinite(
-        date.getTime()
-      )
-    ) {
-      return res.status(400).json({
-        error:
-          "scheduledAt inválido"
-      });
-    }
-
-    // ==========================================
-    // CRIAR JOB
-    // ==========================================
 
     const job = {
-      id: randomUUID(),
+
+      id:
+        randomUUID(),
 
       groupId,
 
@@ -874,21 +1308,22 @@ app.post(
 
       scheduledAt,
 
-      repeat: repeatType,
+      repeat,
 
-      status: "pending",
+      imageUrl,
+
+      product,
+
+      status:
+        "pending",
 
       createdAt:
-        new Date().toISOString(),
-
-      lastStatus: null,
-
-      lastError: null,
-
-      sentAt: null
+        new Date().toISOString()
     };
 
-    jobs.push(job);
+    jobs.push(
+      job
+    );
 
     saveJson(
       JOBS_FILE,
@@ -903,54 +1338,11 @@ app.post(
 );
 
 // ======================================================
-// CALCULAR PRÓXIMA DATA DA REPETIÇÃO
-// ======================================================
-
-function getNextScheduledAt(
-  scheduledAt,
-  repeat
-) {
-  const date =
-    new Date(
-      scheduledAt
-    );
-
-  if (
-    !Number.isFinite(
-      date.getTime()
-    )
-  ) {
-    throw new Error(
-      "Data de agendamento inválida"
-    );
-  }
-
-  if (
-    repeat === "diaria"
-  ) {
-    date.setDate(
-      date.getDate() + 1
-    );
-  }
-
-  if (
-    repeat === "semanal"
-  ) {
-    date.setDate(
-      date.getDate() + 7
-    );
-  }
-
-  return date.toISOString();
-}
-
-// ======================================================
 // ENVIAR AGENDAMENTO
 // ======================================================
 
-async function sendJob(
-  job
-) {
+async function sendJob(job) {
+
   const group =
     groups.find(
       g =>
@@ -974,72 +1366,87 @@ async function sendJob(
     );
   }
 
-  // ==========================================
-  // ENVIO
-  // ==========================================
+  // Enviar imagem + legenda
+  if (
+    job.imageUrl
+  ) {
 
-  await sock.sendMessage(
-    group.jid,
-    {
-      text: job.message
-    }
-  );
+    await sock.sendMessage(
+      group.jid,
+      {
+        image: {
+          url:
+            job.imageUrl
+        },
 
-  const sentAt =
-    new Date().toISOString();
+        caption:
+          job.message
+      }
+    );
+
+  } else {
+
+    // Somente texto
+    await sock.sendMessage(
+      group.jid,
+      {
+        text:
+          job.message
+      }
+    );
+  }
 
   job.sentAt =
-    sentAt;
+    new Date().toISOString();
 
-  job.lastStatus =
-    "sent";
-
-  job.lastError =
-    null;
-
-  // ==========================================
-  // REPETIÇÃO DIÁRIA / SEMANAL
-  // ==========================================
-
+  // Repetição
   if (
     job.repeat ===
       "diaria" ||
     job.repeat ===
       "semanal"
   ) {
-    job.scheduledAt =
-      getNextScheduledAt(
-        job.scheduledAt,
-        job.repeat
+
+    const current =
+      new Date(
+        job.scheduledAt
       );
+
+    const days =
+      job.repeat ===
+        "diaria"
+        ? 1
+        : 7;
+
+    current.setDate(
+      current.getDate() +
+        days
+    );
+
+    job.scheduledAt =
+      current.toISOString();
 
     job.status =
       "pending";
 
-    console.log(
-      `Agendamento repetitivo atualizado: ${job.id} -> ${job.scheduledAt}`
-    );
+    job.lastStatus =
+      "sent";
+
   } else {
-    // ========================================
-    // ENVIO ÚNICO
-    // ========================================
 
     job.status =
       "sent";
-
-    console.log(
-      `Agendamento enviado: ${job.id}`
-    );
   }
 }
 
 // ======================================================
-// ENVIAR AGENDAMENTO MANUALMENTE
+// ENVIAR AGORA
 // ======================================================
 
 app.post(
   "/api/jobs/:id/send",
   async (req, res) => {
+
     const job =
       jobs.find(
         j =>
@@ -1048,13 +1455,17 @@ app.post(
       );
 
     if (!job) {
-      return res.status(404).json({
-        error:
-          "Agendamento não encontrado"
-      });
+
+      return res
+        .status(404)
+        .json({
+          error:
+            "Agendamento não encontrado"
+        });
     }
 
     try {
+
       await sendJob(
         job
       );
@@ -1068,14 +1479,13 @@ app.post(
         ok: true,
         job
       });
+
     } catch (err) {
+
       job.status =
         "error";
 
       job.error =
-        err.message;
-
-      job.lastError =
         err.message;
 
       saveJson(
@@ -1083,22 +1493,25 @@ app.post(
         jobs
       );
 
-      res.status(400).json({
-        error:
-          err.message,
-        job
-      });
+      res
+        .status(400)
+        .json({
+          error:
+            err.message,
+          job
+        });
     }
   }
 );
 
 // ======================================================
-// EXCLUIR AGENDAMENTO
+// DELETAR AGENDAMENTO
 // ======================================================
 
 app.delete(
   "/api/jobs/:id",
   (req, res) => {
+
     const before =
       jobs.length;
 
@@ -1125,95 +1538,11 @@ app.delete(
 );
 
 // ======================================================
-// PAUSAR AGENDAMENTO
-// ======================================================
-
-app.post(
-  "/api/jobs/:id/pause",
-  (req, res) => {
-    const job =
-      jobs.find(
-        j =>
-          j.id ===
-          req.params.id
-      );
-
-    if (!job) {
-      return res.status(404).json({
-        error:
-          "Agendamento não encontrado"
-      });
-    }
-
-    if (
-      job.status ===
-      "sent"
-    ) {
-      return res.status(400).json({
-        error:
-          "Esse agendamento já foi finalizado"
-      });
-    }
-
-    job.status =
-      "paused";
-
-    saveJson(
-      JOBS_FILE,
-      jobs
-    );
-
-    res.json({
-      ok: true,
-      job
-    });
-  }
-);
-
-// ======================================================
-// RETOMAR AGENDAMENTO
-// ======================================================
-
-app.post(
-  "/api/jobs/:id/resume",
-  (req, res) => {
-    const job =
-      jobs.find(
-        j =>
-          j.id ===
-          req.params.id
-      );
-
-    if (!job) {
-      return res.status(404).json({
-        error:
-          "Agendamento não encontrado"
-      });
-    }
-
-    job.status =
-      "pending";
-
-    job.lastError =
-      null;
-
-    saveJson(
-      JOBS_FILE,
-      jobs
-    );
-
-    res.json({
-      ok: true,
-      job
-    });
-  }
-);
-
-// ======================================================
-// PROCESSAR FILA
+// PROCESSADOR DE AGENDAMENTOS
 // ======================================================
 
 async function processJobs() {
+
   if (
     !sock ||
     connectionState !==
@@ -1225,13 +1554,10 @@ async function processJobs() {
   const now =
     Date.now();
 
-  let changed =
-    false;
-
   for (
     const job of jobs
   ) {
-    // Somente pendentes
+
     if (
       job.status !==
       "pending"
@@ -1247,95 +1573,67 @@ async function processJobs() {
     if (
       !Number.isFinite(
         when
-      )
-    ) {
-      job.status =
-        "error";
-
-      job.error =
-        "Data do agendamento inválida";
-
-      job.lastError =
-        job.error;
-
-      changed = true;
-
-      continue;
-    }
-
-    // Ainda não chegou o horário
-    if (
+      ) ||
       when > now
     ) {
       continue;
     }
 
     try {
-      console.log(
-        `Processando agendamento ${job.id}...`
-      );
 
       await sendJob(
         job
       );
 
-      changed = true;
     } catch (err) {
+
       job.status =
         "error";
 
       job.error =
         err.message;
-
-      job.lastError =
-        err.message;
-
-      changed = true;
-
-      console.error(
-        `Erro no agendamento ${job.id}:`,
-        err.message
-      );
     }
   }
 
-  if (changed) {
-    saveJson(
-      JOBS_FILE,
-      jobs
-    );
-  }
+  saveJson(
+    JOBS_FILE,
+    jobs
+  );
 }
 
 // ======================================================
 // SCHEDULER
-// Executa a cada minuto
 // ======================================================
 
 cron.schedule(
   "* * * * *",
   () => {
+
     processJobs()
-      .catch(err =>
-        console.error(
-          "Scheduler:",
-          err.message
-        )
+      .catch(
+        err =>
+          console.error(
+            "Scheduler:",
+            err.message
+          )
       );
+
   },
   {
-    timezone: TZ
+    timezone:
+      TZ
   }
 );
 
 // ======================================================
-// INICIAR SERVIDOR
+// SERVIDOR
 // ======================================================
 
 app.listen(
   PORT,
   "0.0.0.0",
   () => {
+
     console.log(
       `OfertaZap API rodando na porta ${PORT}`
     );
@@ -1345,7 +1643,11 @@ app.listen(
     );
 
     console.log(
-      "Repetição: diária e semanal ativadas."
+      `Mercado Livre OAuth: ${
+        ML_CLIENT_ID
+          ? "configurado"
+          : "não configurado"
+      }`
     );
   }
 );
