@@ -4,49 +4,38 @@ import cors from "cors";
 import cron from "node-cron";
 import QRCode from "qrcode";
 import pino from "pino";
-import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-
-import {
-  default as makeWASocket,
+import { randomUUID } from "node:crypto";
+import { Boom } from "@hapi/boom";
+import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
   makeCacheableSignalKeyStore
 } from "@whiskeysockets/baileys";
-
-import { Boom } from "@hapi/boom";
-
-// ======================================================
-// OFERTAZAP API V12
-// ======================================================
-
-const APP_VERSION = "V12";
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
 
 const app = express();
 
-const PORT =
-  Number(process.env.PORT || 10000);
+const PORT = Number(process.env.PORT || 3000);
 
 const API_TOKEN =
-  String(process.env.API_TOKEN || "").trim();
+  process.env.API_TOKEN || "";
 
 const TZ =
   process.env.TZ ||
   "America/Sao_Paulo";
 
 const ML_CLIENT_ID =
-  String(process.env.ML_CLIENT_ID || "").trim();
+  process.env.ML_CLIENT_ID || "";
 
 const ML_CLIENT_SECRET =
-  String(process.env.ML_CLIENT_SECRET || "").trim();
+  process.env.ML_CLIENT_SECRET || "";
 
 const ML_REDIRECT_URI =
-  String(
-    process.env.ML_REDIRECT_URI ||
-    "https://ofertazap-api1.onrender.com/api/mercadolivre/callback"
-  ).trim();
+  process.env.ML_REDIRECT_URI ||
+  "https://ofertazap-api1.onrender.com/api/mercadolivre/callback";
 
 // ======================================================
 // EXPRESS
@@ -54,18 +43,19 @@ const ML_REDIRECT_URI =
 
 app.use(
   cors({
-    origin: "*"
+    origin:
+      process.env.FRONTEND_ORIGIN || "*"
   })
 );
 
 app.use(
   express.json({
-    limit: "2mb"
+    limit: "1mb"
   })
 );
 
 // ======================================================
-// DIRETÓRIOS
+// PASTAS
 // ======================================================
 
 const DATA_DIR =
@@ -89,58 +79,72 @@ fs.mkdirSync(
 // ======================================================
 
 const GROUPS_FILE =
-  path.join(DATA_DIR, "groups.json");
+  path.join(
+    DATA_DIR,
+    "groups.json"
+  );
 
 const JOBS_FILE =
-  path.join(DATA_DIR, "jobs.json");
+  path.join(
+    DATA_DIR,
+    "jobs.json"
+  );
 
-const ML_FILE =
-  path.join(DATA_DIR, "mercadolivre.json");
+const ML_TOKEN_FILE =
+  path.join(
+    DATA_DIR,
+    "mercadolivre.json"
+  );
 
 // ======================================================
 // JSON
 // ======================================================
 
-function loadJson(file, fallback) {
+function loadJson(
+  file,
+  fallback = []
+) {
   try {
-    if (!fs.existsSync(file)) {
+
+    if (
+      !fs.existsSync(file)
+    ) {
       return fallback;
     }
 
     return JSON.parse(
-      fs.readFileSync(file, "utf8")
-    );
-  } catch (error) {
-    console.error(
-      `Erro lendo ${file}:`,
-      error.message
+      fs.readFileSync(
+        file,
+        "utf8"
+      )
     );
 
+  } catch {
+
     return fallback;
+
   }
 }
 
-function saveJson(file, data) {
-  try {
-    fs.writeFileSync(
-      file,
-      JSON.stringify(
-        data,
-        null,
-        2
-      ),
-      "utf8"
-    );
-  } catch (error) {
-    console.error(
-      `Erro salvando ${file}:`,
-      error.message
-    );
-  }
+function saveJson(
+  file,
+  data
+) {
+
+  fs.writeFileSync(
+    file,
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
+    "utf8"
+  );
+
 }
 
 // ======================================================
-// DADOS
+// ESTADO
 // ======================================================
 
 let groups =
@@ -157,78 +161,60 @@ let jobs =
 
 let mlTokens =
   loadJson(
-    ML_FILE,
+    ML_TOKEN_FILE,
     {}
   );
 
-// ======================================================
-// WHATSAPP
-// ======================================================
+let sock =
+  null;
 
-let sock = null;
-
-let qrDataUrl = null;
+let qrDataUrl =
+  null;
 
 let connectionState =
   "disconnected";
 
-let lastError = null;
+let lastError =
+  null;
+
+let mlOAuthState =
+  null;
 
 // ======================================================
-// OAUTH
+// MERCADO LIVRE
 // ======================================================
 
-let oauthState = null;
-
-// ======================================================
-// FUNÇÕES MERCADO LIVRE
-// ======================================================
-
-function getMissingMercadoLivreVars() {
+function requireMercadoLivreConfig() {
 
   const missing = [];
 
-  if (!ML_CLIENT_ID) {
+  if (
+    !ML_CLIENT_ID
+  ) {
     missing.push(
       "ML_CLIENT_ID"
     );
   }
 
-  if (!ML_CLIENT_SECRET) {
+  if (
+    !ML_CLIENT_SECRET
+  ) {
     missing.push(
       "ML_CLIENT_SECRET"
     );
   }
 
-  if (!ML_REDIRECT_URI) {
+  if (
+    !ML_REDIRECT_URI
+  ) {
     missing.push(
       "ML_REDIRECT_URI"
     );
   }
 
-  return missing;
-}
-
-function mercadoLivreConfigured() {
-
-  return (
-    Boolean(ML_CLIENT_ID) &&
-    Boolean(ML_CLIENT_SECRET) &&
-    Boolean(ML_REDIRECT_URI)
-  );
-
-}
-
-// ======================================================
-// OAUTH URL
-// ======================================================
-
-function buildMercadoLivreAuthUrl() {
-
-  const missing =
-    getMissingMercadoLivreVars();
-
-  if (missing.length) {
+  if (
+    missing.length
+  ) {
 
     throw new Error(
       "Mercado Livre OAuth não configurado. " +
@@ -238,9 +224,19 @@ function buildMercadoLivreAuthUrl() {
 
   }
 
-  oauthState =
+}
+
+// ======================================================
+// URL OAUTH
+// ======================================================
+
+function buildMercadoLivreAuthUrl() {
+
+  requireMercadoLivreConfig();
+
+  mlOAuthState =
     crypto
-      .randomBytes(32)
+      .randomBytes(24)
       .toString("hex");
 
   const url =
@@ -265,7 +261,7 @@ function buildMercadoLivreAuthUrl() {
 
   url.searchParams.set(
     "state",
-    oauthState
+    mlOAuthState
   );
 
   url.searchParams.set(
@@ -274,229 +270,237 @@ function buildMercadoLivreAuthUrl() {
   );
 
   return url.toString();
+
 }
 
 // ======================================================
-// TOKEN
+// TROCAR CODE POR TOKEN
 // ======================================================
 
-async function exchangeCode(code) {
+async function exchangeMercadoLivreCode(
+  code
+) {
 
-  if (
-    !mercadoLivreConfigured()
-  ) {
-
-    throw new Error(
-      "Mercado Livre OAuth não configurado."
-    );
-
-  }
+  requireMercadoLivreConfig();
 
   const body =
-    new URLSearchParams();
+    new URLSearchParams({
 
-  body.set(
-    "grant_type",
-    "authorization_code"
-  );
+      grant_type:
+        "authorization_code",
 
-  body.set(
-    "client_id",
-    ML_CLIENT_ID
-  );
+      client_id:
+        ML_CLIENT_ID,
 
-  body.set(
-    "client_secret",
-    ML_CLIENT_SECRET
-  );
+      client_secret:
+        ML_CLIENT_SECRET,
 
-  body.set(
-    "code",
-    code
-  );
+      code,
 
-  body.set(
-    "redirect_uri",
-    ML_REDIRECT_URI
-  );
+      redirect_uri:
+        ML_REDIRECT_URI
+
+    });
 
   const response =
     await fetch(
       "https://api.mercadolibre.com/oauth/token",
       {
-        method: "POST",
+
+        method:
+          "POST",
 
         headers: {
-          "content-type":
-            "application/x-www-form-urlencoded",
 
           accept:
-            "application/json"
+            "application/json",
+
+          "content-type":
+            "application/x-www-form-urlencoded"
+
         },
 
         body
+
       }
     );
 
   const data =
     await response.json();
 
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
 
     throw new Error(
       data.error_description ||
       data.message ||
-      "Erro ao obter token do Mercado Livre."
+      "Falha ao obter token do Mercado Livre"
     );
 
   }
 
   mlTokens = {
+
     ...data,
+
     savedAt:
       new Date().toISOString()
+
   };
 
   saveJson(
-    ML_FILE,
+    ML_TOKEN_FILE,
     mlTokens
   );
 
   return data;
+
 }
 
 // ======================================================
-// REFRESH TOKEN
+// RENOVAR TOKEN
 // ======================================================
 
-async function refreshToken() {
+async function refreshMercadoLivreToken() {
+
+  requireMercadoLivreConfig();
 
   if (
     !mlTokens.refresh_token
   ) {
 
     throw new Error(
-      "Refresh token do Mercado Livre não encontrado."
+      "Mercado Livre ainda não foi autorizado."
     );
 
   }
 
   const body =
-    new URLSearchParams();
+    new URLSearchParams({
 
-  body.set(
-    "grant_type",
-    "refresh_token"
-  );
+      grant_type:
+        "refresh_token",
 
-  body.set(
-    "client_id",
-    ML_CLIENT_ID
-  );
+      client_id:
+        ML_CLIENT_ID,
 
-  body.set(
-    "client_secret",
-    ML_CLIENT_SECRET
-  );
+      client_secret:
+        ML_CLIENT_SECRET,
 
-  body.set(
-    "refresh_token",
-    mlTokens.refresh_token
-  );
+      refresh_token:
+        mlTokens.refresh_token
+
+    });
 
   const response =
     await fetch(
       "https://api.mercadolibre.com/oauth/token",
       {
-        method: "POST",
+
+        method:
+          "POST",
 
         headers: {
-          "content-type":
-            "application/x-www-form-urlencoded",
 
           accept:
-            "application/json"
+            "application/json",
+
+          "content-type":
+            "application/x-www-form-urlencoded"
+
         },
 
         body
+
       }
     );
 
   const data =
     await response.json();
 
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
 
     throw new Error(
       data.error_description ||
       data.message ||
-      "Erro ao renovar token do Mercado Livre."
+      "Falha ao renovar token do Mercado Livre"
     );
 
   }
 
   mlTokens = {
+
     ...data,
+
     savedAt:
       new Date().toISOString()
+
   };
 
   saveJson(
-    ML_FILE,
+    ML_TOKEN_FILE,
     mlTokens
   );
 
   return data;
+
 }
 
 // ======================================================
 // ACCESS TOKEN
 // ======================================================
 
-async function getAccessToken() {
+async function getMercadoLivreAccessToken() {
 
   if (
     !mlTokens.access_token
   ) {
 
     throw new Error(
-      "Mercado Livre ainda não conectado."
+      "Mercado Livre não conectado. Autorize a conta primeiro."
     );
 
   }
 
-  const saved =
+  const savedAt =
     new Date(
       mlTokens.savedAt || 0
     ).getTime();
 
-  const expires =
-    saved +
+  const expiresAt =
+    savedAt +
     Number(
-      mlTokens.expires_in || 21600
+      mlTokens.expires_in ||
+      21600
     ) *
     1000;
 
   if (
     Date.now() <
-    expires - 120000
+    expiresAt - 120000
   ) {
 
     return mlTokens.access_token;
 
   }
 
-  const renewed =
-    await refreshToken();
+  const refreshed =
+    await refreshMercadoLivreToken();
 
-  return renewed.access_token;
+  return refreshed.access_token;
+
 }
 
 // ======================================================
 // EXTRAIR MLB
 // ======================================================
 
-function extractMLB(value) {
+function extractMercadoLivreItemId(
+  value
+) {
 
   const text =
     String(
@@ -508,8 +512,12 @@ function extractMLB(value) {
       /\bMLB[-_]?\d{6,}\b/i
     );
 
-  if (!match) {
+  if (
+    !match
+  ) {
+
     return null;
+
   }
 
   return match[0]
@@ -518,20 +526,25 @@ function extractMLB(value) {
       ""
     )
     .toUpperCase();
+
 }
 
 // ======================================================
-// RESOLVER LINK
+// RESOLVER LINK MERCADO LIVRE
 // ======================================================
 
-async function resolveMLB(value) {
+async function resolveMercadoLivreItemId(
+  value
+) {
 
   const original =
     String(
       value || ""
     ).trim();
 
-  if (!original) {
+  if (
+    !original
+  ) {
 
     throw new Error(
       "Informe o link do Mercado Livre."
@@ -539,32 +552,63 @@ async function resolveMLB(value) {
 
   }
 
-  // Link direto
-  const direct =
-    extractMLB(original);
+  // --------------------------------------------
+  // Link já contém MLB
+  // --------------------------------------------
 
-  if (direct) {
+  const direct =
+    extractMercadoLivreItemId(
+      original
+    );
+
+  if (
+    direct
+  ) {
+
     return direct;
+
   }
 
-  let current =
-    original;
+  if (
+    !/^https?:\/\//i.test(
+      original
+    )
+  ) {
+
+    throw new Error(
+      "Digite uma URL válida do Mercado Livre."
+    );
+
+  }
+
+  const candidates = [
+    original
+  ];
 
   const visited =
     new Set();
 
-  const candidates =
-    [];
+  let current =
+    original;
 
-  function addCandidate(value) {
+  function addCandidate(
+    value,
+    base
+  ) {
 
-    if (!value) {
+    if (
+      !value
+    ) {
       return;
     }
 
     let text =
-      String(value)
-        .trim()
+      String(
+        value
+      ).trim();
+
+    text =
+      text
         .replace(
           /\\u0026/g,
           "&"
@@ -574,21 +618,55 @@ async function resolveMLB(value) {
           "/"
         );
 
-    candidates.push(
+    try {
+
+      if (
+        base &&
+        !/^https?:\/\//i.test(
+          text
+        )
+      ) {
+
+        text =
+          new URL(
+            text,
+            base
+          ).toString();
+
+      }
+
+    } catch {}
+
+    if (
       text
-    );
+    ) {
+
+      candidates.push(
+        text
+      );
+
+    }
+
   }
 
+  // --------------------------------------------
+  // Até 10 redirecionamentos
+  // --------------------------------------------
+
   for (
-    let i = 0;
-    i < 10;
-    i++
+    let step = 0;
+    step < 10;
+    step++
   ) {
 
     if (
-      visited.has(current)
+      visited.has(
+        current
+      )
     ) {
+
       break;
+
     }
 
     visited.add(
@@ -603,6 +681,7 @@ async function resolveMLB(value) {
         await fetch(
           current,
           {
+
             redirect:
               "manual",
 
@@ -610,21 +689,21 @@ async function resolveMLB(value) {
 
               "user-agent":
                 "Mozilla/5.0 " +
-                "(Linux; Android 10) " +
-                "AppleWebKit/537.36 " +
-                "Chrome/140 Mobile Safari/537.36",
+                "(compatible; OfertaZap/1.0)",
 
               accept:
                 "text/html,application/xhtml+xml," +
                 "application/json;q=0.9,*/*;q=0.8",
 
               "accept-language":
-                "pt-BR,pt;q=0.9"
+                "pt-BR,pt;q=0.9,en;q=0.8"
+
             }
+
           }
         );
 
-    } catch (error) {
+    } catch {
 
       throw new Error(
         "Não consegui abrir o link do Mercado Livre."
@@ -632,42 +711,41 @@ async function resolveMLB(value) {
 
     }
 
+    // ------------------------------------------
+    // URL da resposta
+    // ------------------------------------------
+
     addCandidate(
+      response.url ||
+      current,
       current
     );
 
-    addCandidate(
-      response.url
-    );
+    // ------------------------------------------
+    // Location
+    // ------------------------------------------
 
     const location =
       response.headers.get(
         "location"
       );
 
-    if (location) {
+    if (
+      location
+    ) {
+
+      addCandidate(
+        location,
+        current
+      );
 
       try {
 
-        const next =
+        current =
           new URL(
             location,
             current
           ).toString();
-
-        addCandidate(
-          next
-        );
-
-        const found =
-          extractMLB(next);
-
-        if (found) {
-          return found;
-        }
-
-        current =
-          next;
 
         continue;
 
@@ -675,189 +753,237 @@ async function resolveMLB(value) {
 
     }
 
-    let html = "";
+    // ------------------------------------------
+    // HTML
+    // ------------------------------------------
+
+    let html =
+      "";
 
     try {
+
       html =
         await response.text();
+
     } catch {}
 
-    // Procurar MLB no HTML
-    const htmlIds =
+    // ------------------------------------------
+    // MLB direto no HTML
+    // ------------------------------------------
+
+    const ids =
       html.match(
         /\bMLB[-_]?\d{6,}\b/gi
       ) || [];
 
     if (
-      htmlIds.length
+      ids.length
     ) {
 
-      return extractMLB(
-        htmlIds[0]
-      );
+      return ids[0]
+        .replace(
+          /[-_]/g,
+          ""
+        )
+        .toUpperCase();
 
     }
 
-    // Canonical
-    const canonical =
-      html.match(
-        /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i
-      );
+    // ------------------------------------------
+    // Canonical / OG / redirect / JavaScript
+    // ------------------------------------------
 
-    if (
-      canonical?.[1]
-    ) {
+    const patterns = [
 
-      addCandidate(
-        canonical[1]
-      );
+      /(?:canonical|og:url)[^>]+(?:href|content)=["']([^"']+)["']/gi,
 
-    }
+      /<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']/gi,
 
-    // OG URL
-    const og =
-      html.match(
-        /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i
-      );
+      /(?:window\.)?location(?:\.href|\.replace|\.assign)?\s*(?:=|\()\s*["']([^"']+)["']/gi,
 
-    if (
-      og?.[1]
-    ) {
+      /https?:\\?\/\\?\/[^\s"'<>\\]+/gi
 
-      addCandidate(
-        og[1]
-      );
-
-    }
-
-    // Procurar URLs completas
-    const urls =
-      html.match(
-        /https?:\/\/[^\s"'<>]+/gi
-      ) || [];
+    ];
 
     for (
-      const url
-      of urls
+      const regex
+      of patterns
     ) {
 
-      addCandidate(
-        url
-      );
+      let match;
+
+      while (
+        (
+          match =
+            regex.exec(
+              html
+            )
+        ) !== null
+      ) {
+
+        addCandidate(
+          match[1] ||
+          match[0],
+          current
+        );
+
+      }
 
     }
 
-    // Verificar candidatos
+    // ------------------------------------------
+    // Procurar MLB nos candidatos
+    // ------------------------------------------
+
     for (
       const candidate
       of candidates
     ) {
 
-      const found =
-        extractMLB(
+      const id =
+        extractMercadoLivreItemId(
           candidate
         );
 
-      if (found) {
-        return found;
+      if (
+        id
+      ) {
+
+        return id;
+
       }
 
     }
 
-    // Tentar próxima URL
-    const nextUrl =
+    // ------------------------------------------
+    // Próxima URL
+    // ------------------------------------------
+
+    const next =
       candidates
+        .slice()
         .reverse()
         .find(
-          candidate =>
+          item =>
             /^https?:\/\//i.test(
-              candidate
+              item
             ) &&
             !visited.has(
-              candidate
+              item
             )
         );
 
-    if (nextUrl) {
+    if (
+      next
+    ) {
 
       current =
-        nextUrl;
+        next;
 
       continue;
 
     }
 
     break;
+
   }
 
   throw new Error(
-    "Não consegui identificar o ID do anúncio (MLB) nesse link."
+    "Não consegui identificar o ID do anúncio (MLB) nesse link. " +
+    "O link pode não apontar diretamente para um anúncio do Mercado Livre."
   );
+
 }
 
 // ======================================================
-// PRODUTO MERCADO LIVRE
+// BUSCAR PRODUTO
 // ======================================================
 
-async function getProduct(link) {
+async function getMercadoLivreProduct(
+  value
+) {
 
   const itemId =
-    await resolveMLB(
-      link
+    await resolveMercadoLivreItemId(
+      value
     );
 
+  if (
+    !itemId
+  ) {
+
+    throw new Error(
+      "Não consegui identificar o ID do anúncio (MLB)."
+    );
+
+  }
+
   const token =
-    await getAccessToken();
+    await getMercadoLivreAccessToken();
 
   let response =
     await fetch(
       `https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`,
       {
+
         headers: {
+
           Authorization:
             `Bearer ${token}`,
 
-          accept:
+          Accept:
             "application/json"
+
         }
+
       }
     );
 
   let data =
     await response.json();
 
+  // --------------------------------------------
   // Token expirado
+  // --------------------------------------------
+
   if (
     response.status === 401
   ) {
 
-    const renewed =
-      await refreshToken();
+    const refreshed =
+      await refreshMercadoLivreToken();
 
     response =
       await fetch(
         `https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`,
         {
-          headers: {
-            Authorization:
-              `Bearer ${renewed.access_token}`,
 
-            accept:
+          headers: {
+
+            Authorization:
+              `Bearer ${refreshed.access_token}`,
+
+            Accept:
               "application/json"
+
           }
+
         }
       );
 
     data =
       await response.json();
+
   }
 
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
 
     throw new Error(
       data.message ||
       data.error ||
-      "Erro ao consultar produto."
+      "Falha ao consultar produto no Mercado Livre."
     );
 
   }
@@ -868,9 +994,9 @@ async function getProduct(link) {
     )
       ? data.pictures
           .map(
-            p =>
-              p.secure_url ||
-              p.url
+            picture =>
+              picture.secure_url ||
+              picture.url
           )
           .filter(Boolean)
       : [];
@@ -881,13 +1007,16 @@ async function getProduct(link) {
       data.id,
 
     title:
-      data.title || "",
+      data.title ||
+      "",
 
     price:
-      data.price ?? null,
+      data.price ??
+      null,
 
     oldPrice:
-      data.original_price ?? null,
+      data.original_price ??
+      null,
 
     currency:
       data.currency_id ||
@@ -905,38 +1034,150 @@ async function getProduct(link) {
       null
 
   };
+
 }
 
 // ======================================================
-// AUTENTICAÇÃO API
+// CALLBACK MERCADO LIVRE
 // ======================================================
 
-function authenticate(
+app.get(
+  "/api/mercadolivre/callback",
+  async (
+    req,
+    res
+  ) => {
+
+    try {
+
+      const {
+        code,
+        state,
+        error,
+        error_description
+      } = req.query;
+
+      if (
+        error
+      ) {
+
+        return res
+          .status(400)
+          .send(
+            `Autorização cancelada: ${
+              error_description ||
+              error
+            }`
+          );
+
+      }
+
+      if (
+        !code
+      ) {
+
+        return res
+          .status(400)
+          .send(
+            "Código de autorização não recebido."
+          );
+
+      }
+
+      if (
+        !mlOAuthState ||
+        state !==
+          mlOAuthState
+      ) {
+
+        return res
+          .status(400)
+          .send(
+            "Estado OAuth inválido ou expirado."
+          );
+
+      }
+
+      await exchangeMercadoLivreCode(
+        code
+      );
+
+      mlOAuthState =
+        null;
+
+      res.send(
+        `
+        <h2>
+          OfertaZap conectado ao Mercado Livre ✅
+        </h2>
+
+        <p>
+          Você pode fechar esta página
+          e voltar ao painel.
+        </p>
+        `
+      );
+
+    } catch (
+      error
+    ) {
+
+      res
+        .status(400)
+        .send(
+          `
+          <h2>
+            Erro ao conectar Mercado Livre
+          </h2>
+
+          <p>
+            ${String(
+              error.message
+            ).replace(
+              /[<>]/g,
+              ""
+            )}
+          </p>
+          `
+        );
+
+    }
+
+  }
+);
+
+// ======================================================
+// AUTENTICAÇÃO
+// ======================================================
+
+function authMiddleware(
   req,
   res,
   next
 ) {
 
-  if (!API_TOKEN) {
+  if (
+    !API_TOKEN
+  ) {
 
     return res
       .status(503)
       .json({
         error:
-          "API_TOKEN não configurado."
+          "API_TOKEN não configurado no servidor."
       });
 
   }
 
-  const authorization =
+  const auth =
     req.headers.authorization ||
     "";
 
   const bearer =
-    authorization.startsWith(
+    auth.startsWith(
       "Bearer "
     )
-      ? authorization.substring(7)
+      ? auth.slice(7)
       : "";
 
   const token =
@@ -961,10 +1202,38 @@ function authenticate(
   }
 
   next();
+
 }
 
 // ======================================================
-// HEALTH PÚBLICO
+// HOME
+// ======================================================
+
+app.get(
+  "/",
+  (_req, res) => {
+
+    res.json({
+
+      ok:
+        true,
+
+      service:
+        "OfertaZap API",
+
+      status:
+        connectionState,
+
+      health:
+        "/api/health"
+
+    });
+
+  }
+);
+
+// ======================================================
+// HEALTH
 // ======================================================
 
 app.get(
@@ -979,9 +1248,6 @@ app.get(
       service:
         "OfertaZap API",
 
-      version:
-        APP_VERSION,
-
       time:
         new Date().toISOString()
 
@@ -991,167 +1257,12 @@ app.get(
 );
 
 // ======================================================
-// DIAGNÓSTICO PÚBLICO
-// NÃO MOSTRA SEGREDO
-// ======================================================
-
-app.get(
-  "/api/mercadolivre/diagnostico",
-  (_req, res) => {
-
-    const missing =
-      getMissingMercadoLivreVars();
-
-    res.json({
-
-      ok:
-        true,
-
-      version:
-        APP_VERSION,
-
-      mercadoLivre: {
-
-        configured:
-          missing.length === 0,
-
-        clientId:
-          Boolean(ML_CLIENT_ID),
-
-        clientSecret:
-          Boolean(ML_CLIENT_SECRET),
-
-        redirectUri:
-          Boolean(ML_REDIRECT_URI),
-
-        missing,
-
-        connected:
-          Boolean(
-            mlTokens.access_token
-          )
-
-      }
-
-    });
-
-  }
-);
-
-// ======================================================
-// PROTEGER DEMAIS API
+// PROTEGER API
 // ======================================================
 
 app.use(
   "/api",
-  authenticate
-);
-
-// ======================================================
-// STATUS
-// ======================================================
-
-app.get(
-  "/api/status",
-  (_req, res) => {
-
-    const missing =
-      getMissingMercadoLivreVars();
-
-    res.json({
-
-      ok:
-        true,
-
-      version:
-        APP_VERSION,
-
-      whatsapp: {
-        status:
-          connectionState,
-
-        qrAvailable:
-          Boolean(qrDataUrl)
-      },
-
-      groups:
-        groups.length,
-
-      jobs:
-        jobs.length,
-
-      mercadoLivre: {
-
-        configured:
-          missing.length === 0,
-
-        connected:
-          Boolean(
-            mlTokens.access_token
-          ),
-
-        missing
-
-      },
-
-      lastError
-
-    });
-
-  }
-);
-
-// ======================================================
-// MERCADO LIVRE STATUS
-// ======================================================
-
-app.get(
-  "/api/mercadolivre/status",
-  (_req, res) => {
-
-    const missing =
-      getMissingMercadoLivreVars();
-
-    res.json({
-
-      ok:
-        true,
-
-      version:
-        APP_VERSION,
-
-      configured:
-        missing.length === 0,
-
-      missing,
-
-      connected:
-        Boolean(
-          mlTokens.access_token
-        ),
-
-      diagnostics: {
-
-        clientId:
-          Boolean(
-            ML_CLIENT_ID
-          ),
-
-        clientSecret:
-          Boolean(
-            ML_CLIENT_SECRET
-          ),
-
-        redirectUri:
-          Boolean(
-            ML_REDIRECT_URI
-          )
-
-      }
-
-    });
-
-  }
+  authMiddleware
 );
 
 // ======================================================
@@ -1164,30 +1275,23 @@ app.get(
 
     try {
 
-      const url =
-        buildMercadoLivreAuthUrl();
-
       res.json({
 
         ok:
           true,
 
-        version:
-          APP_VERSION,
-
         authorizationUrl:
-          url
+          buildMercadoLivreAuthUrl()
 
       });
 
-    } catch (error) {
+    } catch (
+      error
+    ) {
 
       res
         .status(503)
         .json({
-          ok:
-            false,
-
           error:
             error.message
         });
@@ -1198,155 +1302,87 @@ app.get(
 );
 
 // ======================================================
-// CALLBACK OAUTH
+// MERCADO LIVRE STATUS
 // ======================================================
 
 app.get(
-  "/api/mercadolivre/callback",
-  async (
-    req,
-    res
-  ) => {
+  "/api/mercadolivre/status",
+  (_req, res) => {
 
-    try {
+    const missing = [];
 
-      const {
-        code,
-        state,
-        error,
-        error_description
-      } = req.query;
+    if (
+      !ML_CLIENT_ID
+    ) {
 
-      if (error) {
-
-        return res
-          .status(400)
-          .send(
-            `Erro: ${
-              error_description ||
-              error
-            }`
-          );
-
-      }
-
-      if (!code) {
-
-        return res
-          .status(400)
-          .send(
-            "Código OAuth não recebido."
-          );
-
-      }
-
-      if (
-        !oauthState ||
-        state !== oauthState
-      ) {
-
-        return res
-          .status(400)
-          .send(
-            "Estado OAuth inválido ou expirado."
-          );
-
-      }
-
-      await exchangeCode(
-        code
+      missing.push(
+        "ML_CLIENT_ID"
       );
-
-      oauthState =
-        null;
-
-      res.send(
-        `
-        <!DOCTYPE html>
-
-        <html lang="pt-BR">
-
-        <head>
-
-          <meta charset="UTF-8">
-
-          <meta name="viewport"
-            content="width=device-width,initial-scale=1">
-
-          <title>OfertaZap</title>
-
-          <style>
-
-            body{
-              font-family:Arial;
-              background:#07110d;
-              color:white;
-              text-align:center;
-              padding:50px 20px;
-            }
-
-            .box{
-              max-width:500px;
-              margin:auto;
-              padding:30px;
-              border-radius:20px;
-              background:#102019;
-            }
-
-            h1{
-              color:#20d66b;
-            }
-
-          </style>
-
-        </head>
-
-        <body>
-
-          <div class="box">
-
-            <h1>
-              ✅ Mercado Livre conectado!
-            </h1>
-
-            <p>
-              A conta foi autorizada
-              com sucesso.
-            </p>
-
-            <p>
-              Você pode fechar esta página
-              e voltar ao OfertaZap.
-            </p>
-
-          </div>
-
-        </body>
-
-        </html>
-        `
-      );
-
-    } catch (error) {
-
-      console.error(
-        "OAuth:",
-        error.message
-      );
-
-      res
-        .status(400)
-        .send(
-          `Erro OAuth: ${error.message}`
-        );
 
     }
+
+    if (
+      !ML_CLIENT_SECRET
+    ) {
+
+      missing.push(
+        "ML_CLIENT_SECRET"
+      );
+
+    }
+
+    if (
+      !ML_REDIRECT_URI
+    ) {
+
+      missing.push(
+        "ML_REDIRECT_URI"
+      );
+
+    }
+
+    res.json({
+
+      ok:
+        true,
+
+      configured:
+        missing.length ===
+        0,
+
+      missing,
+
+      connected:
+        Boolean(
+          mlTokens.access_token &&
+          mlTokens.refresh_token
+        ),
+
+      userId:
+        mlTokens.user_id ||
+        null,
+
+      expiresAt:
+        mlTokens.savedAt
+          ? new Date(
+              new Date(
+                mlTokens.savedAt
+              ).getTime() +
+              Number(
+                mlTokens.expires_in ||
+                21600
+              ) *
+              1000
+            ).toISOString()
+          : null
+
+    });
 
   }
 );
 
 // ======================================================
-// PRODUTO PREVIEW
+// PREVIEW PRODUTO
 // ======================================================
 
 app.post(
@@ -1368,24 +1404,21 @@ app.post(
         link ||
         url;
 
-      if (!productLink) {
+      if (
+        !productLink
+      ) {
 
         return res
           .status(400)
           .json({
             error:
-              "Informe o link do produto."
+              "Informe o link do Mercado Livre."
           });
 
       }
 
-      console.log(
-        "Buscando produto:",
-        productLink
-      );
-
       const product =
-        await getProduct(
+        await getMercadoLivreProduct(
           productLink
         );
 
@@ -1394,30 +1427,318 @@ app.post(
         ok:
           true,
 
-        version:
-          APP_VERSION,
-
         product
 
       });
 
-    } catch (error) {
+    } catch (
+      error
+    ) {
 
       console.error(
-        "Produto:",
+        "Erro produto:",
         error.message
       );
 
       res
         .status(400)
         .json({
-
-          ok:
-            false,
-
           error:
             error.message
+        });
 
+    }
+
+  }
+);
+
+// ======================================================
+// STATUS
+// ======================================================
+
+app.get(
+  "/api/status",
+  (_req, res) => {
+
+    res.json({
+
+      ok:
+        true,
+
+      whatsapp:
+        connectionState,
+
+      qrAvailable:
+        Boolean(
+          qrDataUrl
+        ),
+
+      groups:
+        groups.length,
+
+      jobs:
+        jobs.length,
+
+      lastError
+
+    });
+
+  }
+);
+
+// ======================================================
+// QR CODE
+// ======================================================
+
+app.get(
+  "/api/whatsapp/qr",
+  (_req, res) => {
+
+    if (
+      !qrDataUrl
+    ) {
+
+      return res
+        .status(404)
+        .json({
+          error:
+            "QR Code ainda não disponível."
+        });
+
+    }
+
+    res.json({
+
+      ok:
+        true,
+
+      qr:
+        qrDataUrl
+
+    });
+
+  }
+);
+
+// ======================================================
+// WHATSAPP
+// ======================================================
+
+async function startWhatsApp() {
+
+  if (
+    connectionState ===
+      "connecting" ||
+    connectionState ===
+      "connected"
+  ) {
+
+    return;
+
+  }
+
+  connectionState =
+    "connecting";
+
+  lastError =
+    null;
+
+  const {
+    state,
+    saveCreds
+  } =
+    await useMultiFileAuthState(
+      AUTH_DIR
+    );
+
+  const {
+    version
+  } =
+    await fetchLatestBaileysVersion();
+
+  sock =
+    makeWASocket({
+
+      version,
+
+      logger:
+        pino({
+          level:
+            "silent"
+        }),
+
+      auth: {
+
+        creds:
+          state.creds,
+
+        keys:
+          makeCacheableSignalKeyStore(
+            state.keys,
+            pino({
+              level:
+                "silent"
+            })
+          )
+
+      },
+
+      printQRInTerminal:
+        false,
+
+      browser: [
+        "OfertaZap",
+        "Chrome",
+        "1.0.0"
+      ]
+
+    });
+
+  sock.ev.on(
+    "creds.update",
+    saveCreds
+  );
+
+  sock.ev.on(
+    "connection.update",
+    async ({
+      connection,
+      lastDisconnect,
+      qr
+    }) => {
+
+      if (
+        qr
+      ) {
+
+        qrDataUrl =
+          await QRCode.toDataURL(
+            qr
+          );
+
+      }
+
+      if (
+        connection ===
+        "open"
+      ) {
+
+        connectionState =
+          "connected";
+
+        qrDataUrl =
+          null;
+
+        lastError =
+          null;
+
+        console.log(
+          "WhatsApp conectado."
+        );
+
+      }
+
+      if (
+        connection ===
+        "close"
+      ) {
+
+        connectionState =
+          "disconnected";
+
+        const code =
+          new Boom(
+            lastDisconnect?.error
+          )
+            ?.output
+            ?.statusCode;
+
+        lastError =
+          String(
+            code ||
+            lastDisconnect?.error?.message ||
+            "Conexão encerrada"
+          );
+
+        if (
+          code !==
+          DisconnectReason.loggedOut
+        ) {
+
+          setTimeout(
+            () => {
+
+              startWhatsApp()
+                .catch(
+                  error => {
+
+                    lastError =
+                      error.message;
+
+                    connectionState =
+                      "disconnected";
+
+                  }
+                );
+
+            },
+            5000
+          );
+
+        }
+
+      }
+
+    }
+  );
+
+}
+
+// ======================================================
+// INICIAR WHATSAPP
+// ======================================================
+
+app.post(
+  "/api/whatsapp/start",
+  async (
+    _req,
+    res
+  ) => {
+
+    try {
+
+      await startWhatsApp();
+
+      res.json({
+
+        ok:
+          true,
+
+        status:
+          connectionState,
+
+        qrAvailable:
+          Boolean(
+            qrDataUrl
+          )
+
+      });
+
+    } catch (
+      error
+    ) {
+
+      lastError =
+        error.message;
+
+      connectionState =
+        "disconnected";
+
+      res
+        .status(500)
+        .json({
+          error:
+            error.message
         });
 
     }
@@ -1428,6 +1749,24 @@ app.post(
 // ======================================================
 // GRUPOS
 // ======================================================
+
+function extractInviteCode(
+  value
+) {
+
+  const match =
+    String(
+      value || ""
+    ).match(
+      /chat\.whatsapp\.com\/([A-Za-z0-9_-]+)/i
+    );
+
+  return (
+    match?.[1] ||
+    null
+  );
+
+}
 
 app.get(
   "/api/groups",
@@ -1447,71 +1786,286 @@ app.get(
 
 app.post(
   "/api/groups",
-  (
+  async (
     req,
     res
   ) => {
 
     const {
-      id,
       name,
-      jid,
-      inviteLink
+      inviteLink,
+      jid
     } =
       req.body || {};
 
-    if (!name) {
+    if (
+      !name &&
+      !inviteLink &&
+      !jid
+    ) {
 
       return res
         .status(400)
         .json({
           error:
-            "Nome do grupo obrigatório."
+            "Informe name, inviteLink ou jid"
         });
 
     }
 
-    const group = {
+    let groupJid =
+      jid ||
+      null;
 
-      id:
-        id ||
-        crypto.randomUUID(),
+    let groupName =
+      name ||
+      "Grupo WhatsApp";
 
-      name,
+    try {
 
-      jid:
-        jid ||
-        null,
+      if (
+        !sock
+      ) {
 
-      inviteLink:
-        inviteLink ||
-        null,
+        return res
+          .status(409)
+          .json({
+            error:
+              "WhatsApp não está conectado."
+          });
 
-      createdAt:
-        new Date().toISOString()
+      }
 
-    };
+      if (
+        !groupJid &&
+        inviteLink
+      ) {
 
-    groups.push(
-      group
-    );
+        const code =
+          extractInviteCode(
+            inviteLink
+          );
 
-    saveJson(
-      GROUPS_FILE,
-      groups
-    );
+        if (
+          !code
+        ) {
 
-    res.json({
+          return res
+            .status(400)
+            .json({
+              error:
+                "Link de convite inválido."
+            });
 
-      ok:
-        true,
+        }
 
-      group
+        const info =
+          await sock.groupGetInviteInfo(
+            code
+          );
 
-    });
+        groupJid =
+          info.id;
+
+        groupName =
+          name ||
+          info.subject ||
+          groupName;
+
+        try {
+
+          await sock.groupAcceptInvite(
+            code
+          );
+
+        } catch {}
+
+      }
+
+      const item = {
+
+        id:
+          randomUUID(),
+
+        name:
+          groupName,
+
+        jid:
+          groupJid,
+
+        inviteLink:
+          inviteLink ||
+          null,
+
+        createdAt:
+          new Date().toISOString()
+
+      };
+
+      groups.push(
+        item
+      );
+
+      saveJson(
+        GROUPS_FILE,
+        groups
+      );
+
+      res.json({
+
+        ok:
+          true,
+
+        group:
+          item
+
+      });
+
+    } catch (
+      error
+    ) {
+
+      res
+        .status(400)
+        .json({
+          error:
+            error.message
+        });
+
+    }
 
   }
 );
+
+// ======================================================
+// ENTRAR NO GRUPO
+// ======================================================
+
+app.post(
+  "/api/groups/:id/join",
+  async (
+    req,
+    res
+  ) => {
+
+    try {
+
+      const group =
+        groups.find(
+          item =>
+            item.id ===
+            req.params.id
+        );
+
+      if (
+        !group
+      ) {
+
+        return res
+          .status(404)
+          .json({
+            error:
+              "Grupo não encontrado."
+          });
+
+      }
+
+      if (
+        !sock ||
+        connectionState !==
+          "connected"
+      ) {
+
+        return res
+          .status(409)
+          .json({
+            error:
+              "WhatsApp não está conectado."
+          });
+
+      }
+
+      if (
+        !group.inviteLink
+      ) {
+
+        return res
+          .status(400)
+          .json({
+            error:
+              "Este grupo não possui link de convite."
+          });
+
+      }
+
+      const code =
+        extractInviteCode(
+          group.inviteLink
+        );
+
+      if (
+        !code
+      ) {
+
+        return res
+          .status(400)
+          .json({
+            error:
+              "Link de convite inválido."
+          });
+
+      }
+
+      const jid =
+        await sock.groupAcceptInvite(
+          code
+        );
+
+      if (
+        jid
+      ) {
+
+        group.jid =
+          jid;
+
+      }
+
+      saveJson(
+        GROUPS_FILE,
+        groups
+      );
+
+      res.json({
+
+        ok:
+          true,
+
+        message:
+          "Grupo conectado.",
+
+        group
+
+      });
+
+    } catch (
+      error
+    ) {
+
+      res
+        .status(400)
+        .json({
+          error:
+            error.message
+        });
+
+    }
+
+  }
+);
+
+// ======================================================
+// EXCLUIR GRUPO
+// ======================================================
 
 app.delete(
   "/api/groups/:id",
@@ -1520,7 +2074,7 @@ app.delete(
     res
   ) => {
 
-    const old =
+    const before =
       groups.length;
 
     groups =
@@ -1541,7 +2095,8 @@ app.delete(
         true,
 
       removed:
-        old !== groups.length
+        before !==
+        groups.length
 
     });
 
@@ -1549,7 +2104,7 @@ app.delete(
 );
 
 // ======================================================
-// JOBS
+// AGENDAMENTOS
 // ======================================================
 
 app.get(
@@ -1567,6 +2122,10 @@ app.get(
 
   }
 );
+
+// ======================================================
+// CRIAR AGENDAMENTO
+// ======================================================
 
 app.post(
   "/api/jobs",
@@ -1600,15 +2159,12 @@ app.post(
 
     }
 
-    const allowed =
-      [
+    if (
+      ![
         "unica",
         "diaria",
         "semanal"
-      ];
-
-    if (
-      !allowed.includes(
+      ].includes(
         repeat
       )
     ) {
@@ -1624,12 +2180,14 @@ app.post(
 
     const group =
       groups.find(
-        g =>
-          g.id ===
+        item =>
+          item.id ===
           groupId
       );
 
-    if (!group) {
+    if (
+      !group
+    ) {
 
       return res
         .status(404)
@@ -1643,7 +2201,7 @@ app.post(
     const job = {
 
       id:
-        crypto.randomUUID(),
+        randomUUID(),
 
       groupId,
 
@@ -1690,7 +2248,26 @@ app.post(
 // ENVIAR JOB
 // ======================================================
 
-async function sendJob(job) {
+async function sendJob(
+  job
+) {
+
+  const group =
+    groups.find(
+      item =>
+        item.id ===
+        job.groupId
+    );
+
+  if (
+    !group?.jid
+  ) {
+
+    throw new Error(
+      "Grupo sem JID."
+    );
+
+  }
 
   if (
     !sock ||
@@ -1704,22 +2281,9 @@ async function sendJob(job) {
 
   }
 
-  const group =
-    groups.find(
-      g =>
-        g.id ===
-        job.groupId
-    );
-
-  if (
-    !group?.jid
-  ) {
-
-    throw new Error(
-      "Grupo não possui JID."
-    );
-
-  }
+  // --------------------------------------------
+  // PRODUTO COM IMAGEM
+  // --------------------------------------------
 
   if (
     job.imageUrl
@@ -1757,58 +2321,53 @@ async function sendJob(job) {
   job.sentAt =
     new Date().toISOString();
 
+  // --------------------------------------------
+  // REPETIÇÃO
+  // --------------------------------------------
+
   if (
     job.repeat ===
-    "diaria"
+      "diaria" ||
+    job.repeat ===
+      "semanal"
   ) {
 
-    const next =
+    const current =
       new Date(
         job.scheduledAt
       );
 
-    next.setDate(
-      next.getDate() + 1
+    const days =
+      job.repeat ===
+        "diaria"
+        ? 1
+        : 7;
+
+    current.setDate(
+      current.getDate() +
+      days
     );
 
     job.scheduledAt =
-      next.toISOString();
+      current.toISOString();
 
     job.status =
       "pending";
 
-    return;
-  }
+    job.lastStatus =
+      "sent";
 
-  if (
-    job.repeat ===
-    "semanal"
-  ) {
-
-    const next =
-      new Date(
-        job.scheduledAt
-      );
-
-    next.setDate(
-      next.getDate() + 7
-    );
-
-    job.scheduledAt =
-      next.toISOString();
+  } else {
 
     job.status =
-      "pending";
+      "sent";
 
-    return;
   }
 
-  job.status =
-    "sent";
 }
 
 // ======================================================
-// ENVIO MANUAL
+// ENVIAR MANUALMENTE
 // ======================================================
 
 app.post(
@@ -1820,12 +2379,14 @@ app.post(
 
     const job =
       jobs.find(
-        j =>
-          j.id ===
+        item =>
+          item.id ===
           req.params.id
       );
 
-    if (!job) {
+    if (
+      !job
+    ) {
 
       return res
         .status(404)
@@ -1856,7 +2417,9 @@ app.post(
 
       });
 
-    } catch (error) {
+    } catch (
+      error
+    ) {
 
       job.status =
         "error";
@@ -1872,9 +2435,6 @@ app.post(
       res
         .status(400)
         .json({
-
-          ok:
-            false,
 
           error:
             error.message,
@@ -1904,8 +2464,8 @@ app.delete(
 
     jobs =
       jobs.filter(
-        j =>
-          j.id !==
+        job =>
+          job.id !==
           req.params.id
       );
 
@@ -1920,7 +2480,8 @@ app.delete(
         true,
 
       removed:
-        before !== jobs.length
+        before !==
+        jobs.length
 
     });
 
@@ -1928,7 +2489,7 @@ app.delete(
 );
 
 // ======================================================
-// PROCESSADOR DOS AGENDAMENTOS
+// PROCESSADOR
 // ======================================================
 
 async function processJobs() {
@@ -1940,6 +2501,7 @@ async function processJobs() {
   ) {
 
     return;
+
   }
 
   const now =
@@ -1956,33 +2518,23 @@ async function processJobs() {
     ) {
 
       continue;
+
     }
 
-    const scheduled =
+    const when =
       new Date(
         job.scheduledAt
       ).getTime();
 
     if (
       !Number.isFinite(
-        scheduled
-      )
-    ) {
-
-      job.status =
-        "error";
-
-      job.error =
-        "Data inválida.";
-
-      continue;
-    }
-
-    if (
-      scheduled > now
+        when
+      ) ||
+      when > now
     ) {
 
       continue;
+
     }
 
     try {
@@ -1991,17 +2543,9 @@ async function processJobs() {
         job
       );
 
-      console.log(
-        "Mensagem enviada:",
-        job.id
-      );
-
-    } catch (error) {
-
-      console.error(
-        "Erro envio:",
-        error.message
-      );
+    } catch (
+      error
+    ) {
 
       job.status =
         "error";
@@ -2017,6 +2561,7 @@ async function processJobs() {
     JOBS_FILE,
     jobs
   );
+
 }
 
 // ======================================================
@@ -2044,285 +2589,7 @@ cron.schedule(
 );
 
 // ======================================================
-// WHATSAPP
-// ======================================================
-
-async function startWhatsApp() {
-
-  if (
-    connectionState ===
-      "connecting" ||
-    connectionState ===
-      "connected"
-  ) {
-
-    return;
-  }
-
-  connectionState =
-    "connecting";
-
-  lastError =
-    null;
-
-  try {
-
-    const {
-      state,
-      saveCreds
-    } =
-      await useMultiFileAuthState(
-        AUTH_DIR
-      );
-
-    const {
-      version
-    } =
-      await fetchLatestBaileysVersion();
-
-    sock =
-      makeWASocket({
-
-        version,
-
-        logger:
-          pino({
-            level:
-              "silent"
-          }),
-
-        auth: {
-
-          creds:
-            state.creds,
-
-          keys:
-            makeCacheableSignalKeyStore(
-              state.keys,
-              pino({
-                level:
-                  "silent"
-              })
-            )
-
-        },
-
-        printQRInTerminal:
-          false,
-
-        browser: [
-          "OfertaZap",
-          "Chrome",
-          "1.0.0"
-        ]
-
-      });
-
-    sock.ev.on(
-      "creds.update",
-      saveCreds
-    );
-
-    sock.ev.on(
-      "connection.update",
-      async update => {
-
-        const {
-          connection,
-          lastDisconnect,
-          qr
-        } = update;
-
-        if (qr) {
-
-          qrDataUrl =
-            await QRCode.toDataURL(
-              qr
-            );
-
-          console.log(
-            "Novo QR Code disponível."
-          );
-
-        }
-
-        if (
-          connection ===
-          "open"
-        ) {
-
-          connectionState =
-            "connected";
-
-          qrDataUrl =
-            null;
-
-          lastError =
-            null;
-
-          console.log(
-            "WhatsApp conectado."
-          );
-
-        }
-
-        if (
-          connection ===
-          "close"
-        ) {
-
-          connectionState =
-            "disconnected";
-
-          const statusCode =
-            new Boom(
-              lastDisconnect?.error
-            )
-              ?.output
-              ?.statusCode;
-
-          lastError =
-            String(
-              statusCode ||
-              lastDisconnect?.error?.message ||
-              "Conexão encerrada"
-            );
-
-          console.log(
-            "WhatsApp desconectado:",
-            lastError
-          );
-
-          if (
-            statusCode !==
-            DisconnectReason.loggedOut
-          ) {
-
-            setTimeout(
-              () => {
-
-                startWhatsApp()
-                  .catch(
-                    error => {
-
-                      connectionState =
-                        "disconnected";
-
-                      lastError =
-                        error.message;
-
-                    }
-                  );
-
-              },
-              5000
-            );
-
-          }
-
-        }
-
-      }
-    );
-
-  } catch (error) {
-
-    connectionState =
-      "disconnected";
-
-    lastError =
-      error.message;
-
-    console.error(
-      "WhatsApp:",
-      error.message
-    );
-
-  }
-}
-
-// ======================================================
-// INICIAR WHATSAPP
-// ======================================================
-
-app.post(
-  "/api/whatsapp/start",
-  async (
-    _req,
-    res
-  ) => {
-
-    try {
-
-      await startWhatsApp();
-
-      res.json({
-
-        ok:
-          true,
-
-        version:
-          APP_VERSION,
-
-        status:
-          connectionState,
-
-        qrAvailable:
-          Boolean(qrDataUrl)
-
-      });
-
-    } catch (error) {
-
-      res
-        .status(500)
-        .json({
-          ok:
-            false,
-
-          error:
-            error.message
-        });
-
-    }
-
-  }
-);
-
-// ======================================================
-// QR
-// ======================================================
-
-app.get(
-  "/api/whatsapp/qr",
-  (_req, res) => {
-
-    if (!qrDataUrl) {
-
-      return res
-        .status(404)
-        .json({
-          error:
-            "QR Code não disponível."
-        });
-
-    }
-
-    res.json({
-
-      ok:
-        true,
-
-      qr:
-        qrDataUrl
-
-    });
-
-  }
-);
-
-// ======================================================
-// START SERVER
+// INICIAR SERVIDOR
 // ======================================================
 
 app.listen(
@@ -2331,15 +2598,7 @@ app.listen(
   () => {
 
     console.log(
-      "===================================="
-    );
-
-    console.log(
-      `OfertaZap API ${APP_VERSION}`
-    );
-
-    console.log(
-      `Porta: ${PORT}`
+      `OfertaZap API rodando na porta ${PORT}`
     );
 
     console.log(
@@ -2348,34 +2607,10 @@ app.listen(
 
     console.log(
       "Mercado Livre OAuth:",
-      mercadoLivreConfigured()
-        ? "CONFIGURADO"
-        : "NÃO CONFIGURADO"
-    );
-
-    console.log(
-      "ML_CLIENT_ID:",
-      ML_CLIENT_ID
-        ? "OK"
-        : "AUSENTE"
-    );
-
-    console.log(
-      "ML_CLIENT_SECRET:",
+      ML_CLIENT_ID &&
       ML_CLIENT_SECRET
-        ? "OK"
-        : "AUSENTE"
-    );
-
-    console.log(
-      "ML_REDIRECT_URI:",
-      ML_REDIRECT_URI
-        ? "OK"
-        : "AUSENTE"
-    );
-
-    console.log(
-      "===================================="
+        ? "configurado"
+        : "não configurado"
     );
 
   }
