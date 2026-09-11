@@ -24,39 +24,48 @@ const TZ = process.env.TZ || "America/Sao_Paulo";
 
 const ML_CLIENT_ID = process.env.ML_CLIENT_ID || "";
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || "";
+
 const ML_REDIRECT_URI =
   process.env.ML_REDIRECT_URI ||
   "https://ofertazap-api1.onrender.com/api/mercadolivre/callback";
 
-app.use(cors({
-  origin: process.env.FRONTEND_ORIGIN || "*"
-}));
+app.use(
+  cors({
+    origin: process.env.FRONTEND_ORIGIN || "*"
+  })
+);
 
-app.use(express.json({
-  limit: "1mb"
-}));
-
-// ======================================================
-// DIRETÓRIOS
-// ======================================================
+app.use(
+  express.json({
+    limit: "1mb"
+  })
+);
 
 const DATA_DIR = path.resolve("./data");
 const AUTH_DIR = path.resolve("./auth_info_baileys");
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.mkdirSync(AUTH_DIR, { recursive: true });
+fs.mkdirSync(DATA_DIR, {
+  recursive: true
+});
 
-const GROUPS_FILE = path.join(DATA_DIR, "groups.json");
-const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
-const ML_TOKEN_FILE = path.join(DATA_DIR, "mercadolivre.json");
+fs.mkdirSync(AUTH_DIR, {
+  recursive: true
+});
 
-// ======================================================
-// UTILITÁRIOS
-// ======================================================
+const GROUPS_FILE =
+  path.join(DATA_DIR, "groups.json");
+
+const JOBS_FILE =
+  path.join(DATA_DIR, "jobs.json");
+
+const ML_TOKEN_FILE =
+  path.join(DATA_DIR, "mercadolivre.json");
 
 function loadJson(file, fallback = []) {
   try {
-    if (!fs.existsSync(file)) return fallback;
+    if (!fs.existsSync(file)) {
+      return fallback;
+    }
 
     return JSON.parse(
       fs.readFileSync(file, "utf8")
@@ -69,25 +78,44 @@ function loadJson(file, fallback = []) {
 function saveJson(file, data) {
   fs.writeFileSync(
     file,
-    JSON.stringify(data, null, 2),
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
     "utf8"
   );
 }
 
-// ======================================================
-// ESTADO
-// ======================================================
+let groups =
+  loadJson(
+    GROUPS_FILE,
+    []
+  );
 
-let groups = loadJson(GROUPS_FILE, []);
-let jobs = loadJson(JOBS_FILE, []);
+let jobs =
+  loadJson(
+    JOBS_FILE,
+    []
+  );
 
 let sock = null;
+
 let qrDataUrl = null;
-let connectionState = "disconnected";
+
+let connectionState =
+  "disconnected";
+
 let lastError = null;
 
 let mlOAuthState = null;
-let mlTokens = loadJson(ML_TOKEN_FILE, {});
+
+let mlTokens =
+  loadJson(
+    ML_TOKEN_FILE,
+    {}
+  );
+
 
 // ======================================================
 // MERCADO LIVRE - CONFIGURAÇÃO
@@ -105,20 +133,23 @@ function requireMercadoLivreConfig() {
   }
 }
 
+
 // ======================================================
-// MERCADO LIVRE - URL OAUTH
+// MERCADO LIVRE - OAUTH
 // ======================================================
 
 function buildMercadoLivreAuthUrl() {
   requireMercadoLivreConfig();
 
-  mlOAuthState = crypto
-    .randomBytes(24)
-    .toString("hex");
+  mlOAuthState =
+    crypto
+      .randomBytes(24)
+      .toString("hex");
 
-  const url = new URL(
-    "https://auth.mercadolivre.com.br/authorization"
-  );
+  const url =
+    new URL(
+      "https://auth.mercadolivre.com.br/authorization"
+    );
 
   url.searchParams.set(
     "response_type",
@@ -148,37 +179,47 @@ function buildMercadoLivreAuthUrl() {
   return url.toString();
 }
 
-// ======================================================
-// MERCADO LIVRE - TROCAR CODE POR TOKEN
-// ======================================================
 
 async function exchangeMercadoLivreCode(code) {
   requireMercadoLivreConfig();
 
-  const body = new URLSearchParams({
-    grant_type: "authorization_code",
-    client_id: ML_CLIENT_ID,
-    client_secret: ML_CLIENT_SECRET,
-    code,
-    redirect_uri: ML_REDIRECT_URI
-  });
+  const body =
+    new URLSearchParams({
+      grant_type:
+        "authorization_code",
 
-  const response = await fetch(
-    "https://api.mercadolibre.com/oauth/token",
-    {
-      method: "POST",
+      client_id:
+        ML_CLIENT_ID,
 
-      headers: {
-        accept: "application/json",
-        "content-type":
-          "application/x-www-form-urlencoded"
-      },
+      client_secret:
+        ML_CLIENT_SECRET,
 
-      body
-    }
-  );
+      code,
 
-  const data = await response.json();
+      redirect_uri:
+        ML_REDIRECT_URI
+    });
+
+  const response =
+    await fetch(
+      "https://api.mercadolibre.com/oauth/token",
+      {
+        method: "POST",
+
+        headers: {
+          accept:
+            "application/json",
+
+          "content-type":
+            "application/x-www-form-urlencoded"
+        },
+
+        body
+      }
+    );
+
+  const data =
+    await response.json();
 
   if (!response.ok) {
     throw new Error(
@@ -190,7 +231,8 @@ async function exchangeMercadoLivreCode(code) {
 
   mlTokens = {
     ...data,
-    savedAt: new Date().toISOString()
+    savedAt:
+      new Date().toISOString()
   };
 
   saveJson(
@@ -201,9 +243,6 @@ async function exchangeMercadoLivreCode(code) {
   return data;
 }
 
-// ======================================================
-// MERCADO LIVRE - RENOVAR TOKEN
-// ======================================================
 
 async function refreshMercadoLivreToken() {
   requireMercadoLivreConfig();
@@ -214,29 +253,41 @@ async function refreshMercadoLivreToken() {
     );
   }
 
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    client_id: ML_CLIENT_ID,
-    client_secret: ML_CLIENT_SECRET,
-    refresh_token: mlTokens.refresh_token
-  });
+  const body =
+    new URLSearchParams({
+      grant_type:
+        "refresh_token",
 
-  const response = await fetch(
-    "https://api.mercadolibre.com/oauth/token",
-    {
-      method: "POST",
+      client_id:
+        ML_CLIENT_ID,
 
-      headers: {
-        accept: "application/json",
-        "content-type":
-          "application/x-www-form-urlencoded"
-      },
+      client_secret:
+        ML_CLIENT_SECRET,
 
-      body
-    }
-  );
+      refresh_token:
+        mlTokens.refresh_token
+    });
 
-  const data = await response.json();
+  const response =
+    await fetch(
+      "https://api.mercadolibre.com/oauth/token",
+      {
+        method: "POST",
+
+        headers: {
+          accept:
+            "application/json",
+
+          "content-type":
+            "application/x-www-form-urlencoded"
+        },
+
+        body
+      }
+    );
+
+  const data =
+    await response.json();
 
   if (!response.ok) {
     throw new Error(
@@ -248,7 +299,8 @@ async function refreshMercadoLivreToken() {
 
   mlTokens = {
     ...data,
-    savedAt: new Date().toISOString()
+    savedAt:
+      new Date().toISOString()
   };
 
   saveJson(
@@ -259,9 +311,6 @@ async function refreshMercadoLivreToken() {
   return data;
 }
 
-// ======================================================
-// MERCADO LIVRE - TOKEN ATUAL
-// ======================================================
 
 async function getMercadoLivreAccessToken() {
   if (!mlTokens.access_token) {
@@ -270,14 +319,16 @@ async function getMercadoLivreAccessToken() {
     );
   }
 
-  const savedAt = new Date(
-    mlTokens.savedAt || 0
-  ).getTime();
+  const savedAt =
+    new Date(
+      mlTokens.savedAt || 0
+    ).getTime();
 
   const expiresAt =
     savedAt +
     Number(
-      mlTokens.expires_in || 21600
+      mlTokens.expires_in ||
+      21600
     ) *
       1000;
 
@@ -294,12 +345,14 @@ async function getMercadoLivreAccessToken() {
   return refreshed.access_token;
 }
 
+
 // ======================================================
-// MERCADO LIVRE - EXTRAIR IDs
+// MERCADO LIVRE - EXTRAIR IDS
 // ======================================================
 
 function extractMercadoLivreItemIds(value) {
-  const text = String(value || "");
+  const text =
+    String(value || "");
 
   const matches =
     text.match(
@@ -308,30 +361,31 @@ function extractMercadoLivreItemIds(value) {
 
   return [
     ...new Set(
-      matches.map(id =>
-        id
-          .replace(/[-_]/g, "")
-          .toUpperCase()
+      matches.map(
+        id =>
+          id
+            .replace(
+              /[-_]/g,
+              ""
+            )
+            .toUpperCase()
       )
     )
   ];
 }
 
+
 function extractMercadoLivreItemId(value) {
   return (
-    extractMercadoLivreItemIds(value)[0] ||
-    null
+    extractMercadoLivreItemIds(
+      value
+    )[0] || null
   );
 }
 
+
 // ======================================================
 // MERCADO LIVRE - RESOLVEDOR INTELIGENTE
-// ======================================================
-//
-// IMPORTANTE:
-// Não confia simplesmente no primeiro MLB encontrado.
-// Cada ID é validado na API oficial.
-//
 // ======================================================
 
 async function resolveMercadoLivreItemId(
@@ -339,7 +393,8 @@ async function resolveMercadoLivreItemId(
   accessToken
 ) {
   const original =
-    String(value || "").trim();
+    String(value || "")
+      .trim();
 
   if (!original) {
     throw new Error(
@@ -353,24 +408,24 @@ async function resolveMercadoLivreItemId(
     );
   }
 
-  // ----------------------------------------------------
-  // VALIDA UM ITEM DIRETAMENTE NA API
-  // ----------------------------------------------------
 
   async function validarItem(itemId) {
     try {
-      const response = await fetch(
-        `https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`,
-        {
-          headers: {
-            Authorization:
-              `Bearer ${accessToken}`,
+      const response =
+        await fetch(
+          `https://api.mercadolibre.com/items/${encodeURIComponent(
+            itemId
+          )}`,
+          {
+            headers: {
+              Authorization:
+                `Bearer ${accessToken}`,
 
-            Accept:
-              "application/json"
+              Accept:
+                "application/json"
+            }
           }
-        }
-      );
+        );
 
       if (!response.ok) {
         return null;
@@ -379,40 +434,30 @@ async function resolveMercadoLivreItemId(
       const data =
         await response.json();
 
-      if (
-        !data ||
-        !data.id
-      ) {
-        return null;
-      }
-
-      return data;
+      return data?.id
+        ? data
+        : null;
     } catch {
       return null;
     }
   }
 
-  // ----------------------------------------------------
-  // SE JÁ EXISTE MLB NA URL
-  // ----------------------------------------------------
 
-  const directIds =
+  // Primeiro tenta IDs que já estejam no texto.
+  for (
+    const id of
     extractMercadoLivreItemIds(
       original
-    );
-
-  for (const itemId of directIds) {
+    )
+  ) {
     const valid =
-      await validarItem(itemId);
+      await validarItem(id);
 
     if (valid) {
       return valid.id;
     }
   }
 
-  // ----------------------------------------------------
-  // VERIFICA URL
-  // ----------------------------------------------------
 
   if (
     !/^https?:\/\//i.test(
@@ -424,9 +469,6 @@ async function resolveMercadoLivreItemId(
     );
   }
 
-  // ----------------------------------------------------
-  // CANDIDATOS
-  // ----------------------------------------------------
 
   const candidates = [
     original
@@ -435,17 +477,22 @@ async function resolveMercadoLivreItemId(
   const visited =
     new Set();
 
-  let current =
-    original;
+  let lastNetworkError =
+    null;
+
 
   function addCandidate(
     valueToAdd,
-    base = current
+    base = original
   ) {
-    if (!valueToAdd) return;
+    if (!valueToAdd) {
+      return;
+    }
 
     let text =
-      String(valueToAdd).trim();
+      String(
+        valueToAdd
+      ).trim();
 
     text =
       text
@@ -479,66 +526,135 @@ async function resolveMercadoLivreItemId(
 
     if (
       text &&
-      !candidates.includes(text)
+      !candidates.includes(
+        text
+      )
     ) {
-      candidates.push(text);
+      candidates.push(
+        text
+      );
     }
   }
 
-  // ----------------------------------------------------
-  // PERCORRE REDIRECIONAMENTOS
-  // ----------------------------------------------------
+
+  async function inspectUrl(url) {
+    const headersList = [
+      {
+        "user-agent":
+          "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
+
+        accept:
+          "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+
+        "accept-language":
+          "pt-BR,pt;q=0.9,en;q=0.8"
+      },
+
+      {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+
+        accept:
+          "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8"
+      }
+    ];
+
+
+    for (
+      const headers of
+      headersList
+    ) {
+      for (
+        const redirect of [
+          "follow",
+          "manual"
+        ]
+      ) {
+        try {
+          const response =
+            await fetch(
+              url,
+              {
+                redirect,
+                headers
+              }
+            );
+
+          addCandidate(
+            response.url ||
+              url,
+            url
+          );
+
+          const location =
+            response.headers.get(
+              "location"
+            );
+
+          if (location) {
+            addCandidate(
+              location,
+              url
+            );
+          }
+
+          let html = "";
+
+          try {
+            html =
+              await response.text();
+          } catch {}
+
+          return {
+            response,
+            html
+          };
+        } catch (err) {
+          lastNetworkError =
+            err;
+        }
+      }
+    }
+
+    return null;
+  }
+
 
   for (
     let step = 0;
-    step < 10;
+    step < 12;
     step++
   ) {
-    if (
-      visited.has(current)
-    ) {
+    const current =
+      candidates.find(
+        x =>
+          !visited.has(x) &&
+          /^https?:\/\//i.test(
+            x
+          )
+      );
+
+    if (!current) {
       break;
     }
 
-    visited.add(current);
-
-    let response;
-
-    try {
-      response =
-        await fetch(
-          current,
-          {
-            redirect:
-              "manual",
-
-            headers: {
-              "user-agent":
-                "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-
-              accept:
-                "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-
-              "accept-language":
-                "pt-BR,pt;q=0.9,en;q=0.8"
-            }
-          }
-        );
-    } catch {
-      throw new Error(
-        "Não consegui abrir o link do Mercado Livre. Confira se o link está correto."
-      );
-    }
-
-    addCandidate(
-      response.url ||
-        current,
+    visited.add(
       current
     );
 
-    // --------------------------------------------------
-    // LOCATION
-    // --------------------------------------------------
+    const result =
+      await inspectUrl(
+        current
+      );
+
+    if (!result) {
+      continue;
+    }
+
+    const {
+      response,
+      html
+    } = result;
 
     const location =
       response.headers.get(
@@ -550,32 +666,8 @@ async function resolveMercadoLivreItemId(
         location,
         current
       );
-
-      try {
-        current =
-          new URL(
-            location,
-            current
-          ).toString();
-
-        continue;
-      } catch {}
     }
 
-    // --------------------------------------------------
-    // HTML
-    // --------------------------------------------------
-
-    let html = "";
-
-    try {
-      html =
-        await response.text();
-    } catch {}
-
-    // --------------------------------------------------
-    // PADRÕES DE URL
-    // --------------------------------------------------
 
     const patterns = [
       /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/gi,
@@ -588,11 +680,13 @@ async function resolveMercadoLivreItemId(
 
       /(?:window\.)?location(?:\.href|\.replace|\.assign)?\s*(?:=|\()\s*["']([^"']+)["']/gi,
 
-      /https?:\\?\/\\?\/[^\s"'<>\\]+/gi
+      /https?:\\?\/\\?\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+/gi
     ];
 
+
     for (
-      const regex of patterns
+      const regex of
+      patterns
     ) {
       let match;
 
@@ -610,11 +704,9 @@ async function resolveMercadoLivreItemId(
       }
     }
 
-    // --------------------------------------------------
-    // COLETA TODOS OS MLB
-    // --------------------------------------------------
 
-    const allIds = [];
+    const ids = [];
+
 
     for (
       const candidate
@@ -627,22 +719,21 @@ async function resolveMercadoLivreItemId(
         )
       ) {
         if (
-          !allIds.includes(id)
+          !ids.includes(id)
         ) {
-          allIds.push(id);
+          ids.push(id);
         }
       }
     }
 
-    // --------------------------------------------------
-    // TESTA TODOS OS IDS
-    // --------------------------------------------------
 
     for (
-      const id of allIds
+      const id of ids
     ) {
       const valid =
-        await validarItem(id);
+        await validarItem(
+          id
+        );
 
       if (valid) {
         console.log(
@@ -651,50 +742,37 @@ async function resolveMercadoLivreItemId(
 
         return valid.id;
       }
-
-      console.log(
-        `[Mercado Livre] Item ignorado (não encontrado): ${id}`
-      );
     }
-
-    // --------------------------------------------------
-    // PRÓXIMA URL
-    // --------------------------------------------------
-
-    const next =
-      candidates
-        .slice()
-        .reverse()
-        .find(
-          url =>
-            /^https?:\/\//i.test(
-              url
-            ) &&
-            !visited.has(
-              url
-            )
-        );
-
-    if (next) {
-      current =
-        next;
-
-      continue;
-    }
-
-    break;
   }
 
+
+  if (
+    lastNetworkError
+  ) {
+    console.error(
+      "[Mercado Livre] Erro ao acessar link:",
+      lastNetworkError.message
+    );
+
+    throw new Error(
+      "O servidor não conseguiu acessar o link meli.la. Tente novamente ou use o link completo do anúncio do Mercado Livre."
+    );
+  }
+
+
   throw new Error(
-    "Não consegui encontrar um anúncio válido do Mercado Livre nesse link. O link pode ter expirado, apontar para uma página intermediária ou o anúncio pode ter sido removido."
+    "Não consegui encontrar um anúncio válido do Mercado Livre nesse link."
   );
 }
+
 
 // ======================================================
 // MERCADO LIVRE - BUSCAR PRODUTO
 // ======================================================
 
-async function getMercadoLivreProduct(value) {
+async function getMercadoLivreProduct(
+  value
+) {
   let accessToken =
     await getMercadoLivreAccessToken();
 
@@ -704,9 +782,12 @@ async function getMercadoLivreProduct(value) {
       accessToken
     );
 
+
   async function buscarItem(token) {
     return fetch(
-      `https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`,
+      `https://api.mercadolibre.com/items/${encodeURIComponent(
+        itemId
+      )}`,
       {
         headers: {
           Authorization:
@@ -719,14 +800,12 @@ async function getMercadoLivreProduct(value) {
     );
   }
 
+
   let response =
     await buscarItem(
       accessToken
     );
 
-  // ----------------------------------------------------
-  // TOKEN EXPIRADO
-  // ----------------------------------------------------
 
   if (
     response.status === 401
@@ -743,12 +822,14 @@ async function getMercadoLivreProduct(value) {
       );
   }
 
+
   let data = {};
 
   try {
     data =
       await response.json();
   } catch {}
+
 
   if (!response.ok) {
     throw new Error(
@@ -759,9 +840,6 @@ async function getMercadoLivreProduct(value) {
     );
   }
 
-  // ----------------------------------------------------
-  // IMAGENS
-  // ----------------------------------------------------
 
   const pictures =
     Array.isArray(
@@ -776,9 +854,6 @@ async function getMercadoLivreProduct(value) {
           .filter(Boolean)
       : [];
 
-  // ----------------------------------------------------
-  // PRODUTO
-  // ----------------------------------------------------
 
   return {
     id:
@@ -810,11 +885,9 @@ async function getMercadoLivreProduct(value) {
   };
 }
 
+
 // ======================================================
 // MERCADO LIVRE - CALLBACK OAUTH
-// ======================================================
-//
-// Público porque o Mercado Livre redireciona o navegador.
 // ======================================================
 
 app.get(
@@ -831,6 +904,7 @@ app.get(
         error_description
       } = req.query;
 
+
       if (error) {
         return res
           .status(400)
@@ -842,6 +916,7 @@ app.get(
           );
       }
 
+
       if (!code) {
         return res
           .status(400)
@@ -850,9 +925,11 @@ app.get(
           );
       }
 
+
       if (
         !mlOAuthState ||
-        state !== mlOAuthState
+        state !==
+          mlOAuthState
       ) {
         return res
           .status(400)
@@ -861,6 +938,7 @@ app.get(
           );
       }
 
+
       await exchangeMercadoLivreCode(
         code
       );
@@ -868,26 +946,25 @@ app.get(
       mlOAuthState =
         null;
 
-      res.send(`
-        <h2>OfertaZap conectado ao Mercado Livre ✅</h2>
-        <p>Você pode fechar esta página e voltar ao painel.</p>
-      `);
 
+      res.send(
+        "<h2>OfertaZap conectado ao Mercado Livre ✅</h2><p>Você pode fechar esta página e voltar ao painel.</p>"
+      );
     } catch (err) {
       res
         .status(400)
-        .send(`
-          <h2>Erro ao conectar Mercado Livre</h2>
-          <p>${String(
+        .send(
+          `<h2>Erro ao conectar Mercado Livre</h2><p>${String(
             err.message
           ).replace(
             /[<>]/g,
             ""
-          )}</p>
-        `);
+          )}</p>`
+        );
     }
   }
 );
+
 
 // ======================================================
 // AUTENTICAÇÃO DA API
@@ -907,6 +984,7 @@ function authMiddleware(
       });
   }
 
+
   const auth =
     req.headers.authorization ||
     "";
@@ -918,6 +996,7 @@ function authMiddleware(
       ? auth.slice(7)
       : "";
 
+
   const token =
     bearer ||
     req.headers[
@@ -925,8 +1004,10 @@ function authMiddleware(
     ] ||
     "";
 
+
   if (
-    token !== API_TOKEN
+    token !==
+    API_TOKEN
   ) {
     return res
       .status(401)
@@ -936,52 +1017,61 @@ function authMiddleware(
       });
   }
 
+
   next();
 }
 
+
 // ======================================================
-// RAIZ
+// ROTAS PÚBLICAS
 // ======================================================
 
 app.get(
   "/",
-  (_req, res) => {
+  (
+    _req,
+    res
+  ) => {
     res.json({
-      ok: true,
+      ok:
+        true,
+
       service:
         "OfertaZap API",
+
       status:
         connectionState,
+
       health:
         "/api/health"
     });
   }
 );
 
-// ======================================================
-// HEALTH PÚBLICO
-// ======================================================
 
 app.get(
   "/api/health",
-  (_req, res) => {
+  (
+    _req,
+    res
+  ) => {
     res.json({
-      ok: true,
+      ok:
+        true,
+
       service:
         "OfertaZap API",
+
       time:
         new Date().toISOString()
     });
   }
 );
 
+
 // ======================================================
 // MERCADO LIVRE - INICIAR OAUTH
-// ======================================================
-//
-// IMPORTANTE:
-// Fica antes do authMiddleware.
-// Assim o navegador consegue iniciar o OAuth.
+// PÚBLICO
 // ======================================================
 
 app.get(
@@ -994,10 +1084,11 @@ app.get(
       const authorizationUrl =
         buildMercadoLivreAuthUrl();
 
+
       if (
         String(
           req.query.redirect ||
-            ""
+          ""
         ) === "1"
       ) {
         return res.redirect(
@@ -1005,22 +1096,27 @@ app.get(
         );
       }
 
+
       return res.json({
-        ok: true,
+        ok:
+          true,
+
         authorizationUrl
       });
-
     } catch (err) {
       return res
         .status(503)
         .json({
-          ok: false,
+          ok:
+            false,
+
           error:
             err.message
         });
     }
   }
 );
+
 
 // ======================================================
 // TODAS AS OUTRAS ROTAS /API EXIGEM TOKEN
@@ -1031,14 +1127,20 @@ app.use(
   authMiddleware
 );
 
+
 // ======================================================
 // MERCADO LIVRE - STATUS
 // ======================================================
 
 app.get(
   "/api/mercadolivre/status",
-  (_req, res) => {
-    const missing = [];
+  (
+    _req,
+    res
+  ) => {
+    const missing =
+      [];
+
 
     if (!ML_CLIENT_ID) {
       missing.push(
@@ -1046,11 +1148,13 @@ app.get(
       );
     }
 
+
     if (!ML_CLIENT_SECRET) {
       missing.push(
         "ML_CLIENT_SECRET"
       );
     }
+
 
     if (!ML_REDIRECT_URI) {
       missing.push(
@@ -1058,12 +1162,13 @@ app.get(
       );
     }
 
+
     res.json({
-      ok: true,
+      ok:
+        true,
 
       configured:
-        missing.length ===
-        0,
+        missing.length === 0,
 
       missing,
 
@@ -1083,19 +1188,20 @@ app.get(
               new Date(
                 mlTokens.savedAt
               ).getTime() +
-              Number(
-                mlTokens.expires_in ||
+                Number(
+                  mlTokens.expires_in ||
                   21600
-              ) *
-                1000
+                ) *
+                  1000
             ).toISOString()
           : null
     });
   }
 );
 
+
 // ======================================================
-// MERCADO LIVRE - PREVIEW DO PRODUTO
+// MERCADO LIVRE - PREVIEW
 // ======================================================
 
 app.post(
@@ -1108,10 +1214,14 @@ app.post(
       const {
         link,
         url
-      } = req.body || {};
+      } =
+        req.body || {};
+
 
       const productLink =
-        link || url;
+        link ||
+        url;
+
 
       if (!productLink) {
         return res
@@ -1122,16 +1232,19 @@ app.post(
           });
       }
 
+
       const product =
         await getMercadoLivreProduct(
           productLink
         );
 
+
       res.json({
-        ok: true,
+        ok:
+          true,
+
         product
       });
-
     } catch (err) {
       res
         .status(400)
@@ -1143,23 +1256,26 @@ app.post(
   }
 );
 
+
 // ======================================================
 // STATUS GERAL
 // ======================================================
 
 app.get(
   "/api/status",
-  (_req, res) => {
+  (
+    _req,
+    res
+  ) => {
     res.json({
-      ok: true,
+      ok:
+        true,
 
       whatsapp:
         connectionState,
 
       qrAvailable:
-        Boolean(
-          qrDataUrl
-        ),
+        Boolean(qrDataUrl),
 
       groups:
         groups.length,
@@ -1172,13 +1288,17 @@ app.get(
   }
 );
 
+
 // ======================================================
 // WHATSAPP - QR CODE
 // ======================================================
 
 app.get(
   "/api/whatsapp/qr",
-  (_req, res) => {
+  (
+    _req,
+    res
+  ) => {
     if (!qrDataUrl) {
       return res
         .status(404)
@@ -1188,16 +1308,20 @@ app.get(
         });
     }
 
+
     res.json({
-      ok: true,
+      ok:
+        true,
+
       qr:
         qrDataUrl
     });
   }
 );
 
+
 // ======================================================
-// WHATSAPP - INICIAR
+// WHATSAPP - CONECTAR
 // ======================================================
 
 async function startWhatsApp() {
@@ -1210,11 +1334,13 @@ async function startWhatsApp() {
     return;
   }
 
+
   connectionState =
     "connecting";
 
   lastError =
     null;
+
 
   const {
     state,
@@ -1224,10 +1350,12 @@ async function startWhatsApp() {
       AUTH_DIR
     );
 
+
   const {
     version
   } =
     await fetchLatestBaileysVersion();
+
 
   sock =
     makeWASocket({
@@ -1263,10 +1391,12 @@ async function startWhatsApp() {
       ]
     });
 
+
   sock.ev.on(
     "creds.update",
     saveCreds
   );
+
 
   sock.ev.on(
     "connection.update",
@@ -1275,13 +1405,13 @@ async function startWhatsApp() {
       lastDisconnect,
       qr
     }) => {
-
       if (qr) {
         qrDataUrl =
           await QRCode.toDataURL(
             qr
           );
       }
+
 
       if (
         connection ===
@@ -1301,6 +1431,7 @@ async function startWhatsApp() {
         );
       }
 
+
       if (
         connection ===
         "close"
@@ -1308,22 +1439,22 @@ async function startWhatsApp() {
         connectionState =
           "disconnected";
 
+
         const code =
           new Boom(
-            lastDisconnect
-              ?.error
-          )
-            ?.output
+            lastDisconnect?.error
+          )?.output
             ?.statusCode;
+
 
         lastError =
           String(
             code ||
-            lastDisconnect
-              ?.error
+            lastDisconnect?.error
               ?.message ||
             "Conexão encerrada"
           );
+
 
         if (
           code !==
@@ -1349,9 +1480,6 @@ async function startWhatsApp() {
   );
 }
 
-// ======================================================
-// WHATSAPP - START API
-// ======================================================
 
 app.post(
   "/api/whatsapp/start",
@@ -1362,8 +1490,10 @@ app.post(
     try {
       await startWhatsApp();
 
+
       res.json({
-        ok: true,
+        ok:
+          true,
 
         status:
           connectionState,
@@ -1373,13 +1503,13 @@ app.post(
             qrDataUrl
           )
       });
-
     } catch (err) {
       lastError =
         err.message;
 
       connectionState =
         "disconnected";
+
 
       res
         .status(500)
@@ -1391,8 +1521,9 @@ app.post(
   }
 );
 
+
 // ======================================================
-// WHATSAPP - CONVITE
+// GRUPOS
 // ======================================================
 
 function extractInviteCode(
@@ -1410,23 +1541,22 @@ function extractInviteCode(
   );
 }
 
-// ======================================================
-// GRUPOS - LISTAR
-// ======================================================
 
 app.get(
   "/api/groups",
-  (_req, res) => {
+  (
+    _req,
+    res
+  ) => {
     res.json({
-      ok: true,
+      ok:
+        true,
+
       groups
     });
   }
 );
 
-// ======================================================
-// GRUPOS - ADICIONAR
-// ======================================================
 
 app.post(
   "/api/groups",
@@ -1441,6 +1571,7 @@ app.post(
     } =
       req.body || {};
 
+
     if (
       !name &&
       !inviteLink &&
@@ -1454,12 +1585,15 @@ app.post(
         });
     }
 
+
     let groupJid =
-      jid || null;
+      jid ||
+      null;
 
     let groupName =
       name ||
       "Grupo WhatsApp";
+
 
     try {
       if (!sock) {
@@ -1471,6 +1605,7 @@ app.post(
           });
       }
 
+
       if (
         !groupJid &&
         inviteLink
@@ -1479,6 +1614,7 @@ app.post(
           extractInviteCode(
             inviteLink
           );
+
 
         if (!code) {
           return res
@@ -1489,18 +1625,22 @@ app.post(
             });
         }
 
+
         const info =
           await sock.groupGetInviteInfo(
             code
           );
 
+
         groupJid =
           info.id;
+
 
         groupName =
           name ||
           info.subject ||
           groupName;
+
 
         try {
           await sock.groupAcceptInvite(
@@ -1508,6 +1648,7 @@ app.post(
           );
         } catch {}
       }
+
 
       const item = {
         id:
@@ -1527,21 +1668,25 @@ app.post(
           new Date().toISOString()
       };
 
+
       groups.push(
         item
       );
+
 
       saveJson(
         GROUPS_FILE,
         groups
       );
 
+
       res.json({
-        ok: true,
+        ok:
+          true,
+
         group:
           item
       });
-
     } catch (err) {
       res
         .status(400)
@@ -1553,9 +1698,6 @@ app.post(
   }
 );
 
-// ======================================================
-// GRUPOS - EXCLUIR
-// ======================================================
 
 app.delete(
   "/api/groups/:id",
@@ -1566,6 +1708,7 @@ app.delete(
     const before =
       groups.length;
 
+
     groups =
       groups.filter(
         g =>
@@ -1573,13 +1716,16 @@ app.delete(
           req.params.id
       );
 
+
     saveJson(
       GROUPS_FILE,
       groups
     );
 
+
     res.json({
-      ok: true,
+      ok:
+        true,
 
       removed:
         before !==
@@ -1588,9 +1734,6 @@ app.delete(
   }
 );
 
-// ======================================================
-// GRUPOS - ENTRAR
-// ======================================================
 
 app.post(
   "/api/groups/:id/join",
@@ -1606,6 +1749,7 @@ app.post(
             req.params.id
         );
 
+
       if (!group) {
         return res
           .status(404)
@@ -1614,6 +1758,7 @@ app.post(
               "Grupo não encontrado"
           });
       }
+
 
       if (
         !sock ||
@@ -1628,9 +1773,8 @@ app.post(
           });
       }
 
-      if (
-        !group.inviteLink
-      ) {
+
+      if (!group.inviteLink) {
         return res
           .status(400)
           .json({
@@ -1639,10 +1783,12 @@ app.post(
           });
       }
 
+
       const code =
         extractInviteCode(
           group.inviteLink
         );
+
 
       if (!code) {
         return res
@@ -1653,30 +1799,34 @@ app.post(
           });
       }
 
+
       const jid =
         await sock.groupAcceptInvite(
           code
         );
+
 
       if (jid) {
         group.jid =
           jid;
       }
 
+
       saveJson(
         GROUPS_FILE,
         groups
       );
 
+
       res.json({
-        ok: true,
+        ok:
+          true,
 
         message:
           "Grupo conectado.",
 
         group
       });
-
     } catch (err) {
       res
         .status(400)
@@ -1688,23 +1838,26 @@ app.post(
   }
 );
 
+
 // ======================================================
-// AGENDAMENTOS - LISTAR
+// AGENDAMENTOS
 // ======================================================
 
 app.get(
   "/api/jobs",
-  (_req, res) => {
+  (
+    _req,
+    res
+  ) => {
     res.json({
-      ok: true,
+      ok:
+        true,
+
       jobs
     });
   }
 );
 
-// ======================================================
-// AGENDAMENTOS - CRIAR
-// ======================================================
 
 app.post(
   "/api/jobs",
@@ -1716,11 +1869,15 @@ app.post(
       groupId,
       message,
       scheduledAt,
-      repeat = "unica",
-      imageUrl = null,
-      product = null
+      repeat =
+        "unica",
+      imageUrl =
+        null,
+      product =
+        null
     } =
       req.body || {};
+
 
     if (
       !groupId ||
@@ -1734,6 +1891,7 @@ app.post(
             "groupId, message e scheduledAt são obrigatórios"
         });
     }
+
 
     if (
       ![
@@ -1752,12 +1910,14 @@ app.post(
         });
     }
 
+
     const group =
       groups.find(
         g =>
           g.id ===
           groupId
       );
+
 
     if (!group) {
       return res
@@ -1767,6 +1927,7 @@ app.post(
             "Grupo não encontrado"
         });
     }
+
 
     const job = {
       id:
@@ -1791,24 +1952,30 @@ app.post(
         new Date().toISOString()
     };
 
+
     jobs.push(
       job
     );
+
 
     saveJson(
       JOBS_FILE,
       jobs
     );
 
+
     res.json({
-      ok: true,
+      ok:
+        true,
+
       job
     });
   }
 );
 
+
 // ======================================================
-// ENVIO DO AGENDAMENTO
+// ENVIAR AGENDAMENTO
 // ======================================================
 
 async function sendJob(
@@ -1821,11 +1988,13 @@ async function sendJob(
         job.groupId
     );
 
+
   if (!group?.jid) {
     throw new Error(
       "Grupo sem JID"
     );
   }
+
 
   if (
     !sock ||
@@ -1837,9 +2006,8 @@ async function sendJob(
     );
   }
 
-  if (
-    job.imageUrl
-  ) {
+
+  if (job.imageUrl) {
     await sock.sendMessage(
       group.jid,
       {
@@ -1862,12 +2030,10 @@ async function sendJob(
     );
   }
 
+
   job.sentAt =
     new Date().toISOString();
 
-  // ----------------------------------------------------
-  // REPETIÇÃO
-  // ----------------------------------------------------
 
   if (
     job.repeat ===
@@ -1880,35 +2046,36 @@ async function sendJob(
         job.scheduledAt
       );
 
+
     const days =
       job.repeat ===
-        "diaria"
+      "diaria"
         ? 1
         : 7;
+
 
     current.setDate(
       current.getDate() +
         days
     );
 
+
     job.scheduledAt =
       current.toISOString();
+
 
     job.status =
       "pending";
 
+
     job.lastStatus =
       "sent";
-
   } else {
     job.status =
       "sent";
   }
 }
 
-// ======================================================
-// AGENDAMENTO - ENVIAR AGORA
-// ======================================================
 
 app.post(
   "/api/jobs/:id/send",
@@ -1923,6 +2090,7 @@ app.post(
           req.params.id
       );
 
+
     if (!job) {
       return res
         .status(404)
@@ -1932,21 +2100,25 @@ app.post(
         });
     }
 
+
     try {
       await sendJob(
         job
       );
+
 
       saveJson(
         JOBS_FILE,
         jobs
       );
 
+
       res.json({
-        ok: true,
+        ok:
+          true,
+
         job
       });
-
     } catch (err) {
       job.status =
         "error";
@@ -1954,10 +2126,12 @@ app.post(
       job.error =
         err.message;
 
+
       saveJson(
         JOBS_FILE,
         jobs
       );
+
 
       res
         .status(400)
@@ -1971,9 +2145,6 @@ app.post(
   }
 );
 
-// ======================================================
-// AGENDAMENTO - EXCLUIR
-// ======================================================
 
 app.delete(
   "/api/jobs/:id",
@@ -1984,6 +2155,7 @@ app.delete(
     const before =
       jobs.length;
 
+
     jobs =
       jobs.filter(
         j =>
@@ -1991,13 +2163,16 @@ app.delete(
           req.params.id
       );
 
+
     saveJson(
       JOBS_FILE,
       jobs
     );
 
+
     res.json({
-      ok: true,
+      ok:
+        true,
 
       removed:
         before !==
@@ -2005,6 +2180,7 @@ app.delete(
     });
   }
 );
+
 
 // ======================================================
 // PROCESSAR AGENDAMENTOS
@@ -2019,8 +2195,10 @@ async function processJobs() {
     return;
   }
 
+
   const now =
     Date.now();
+
 
   for (
     const job of jobs
@@ -2032,10 +2210,12 @@ async function processJobs() {
       continue;
     }
 
+
     const when =
       new Date(
         job.scheduledAt
       ).getTime();
+
 
     if (
       !Number.isFinite(
@@ -2046,11 +2226,11 @@ async function processJobs() {
       continue;
     }
 
+
     try {
       await sendJob(
         job
       );
-
     } catch (err) {
       job.status =
         "error";
@@ -2060,11 +2240,13 @@ async function processJobs() {
     }
   }
 
+
   saveJson(
     JOBS_FILE,
     jobs
   );
 }
+
 
 // ======================================================
 // CRON - A CADA MINUTO
@@ -2087,6 +2269,7 @@ cron.schedule(
       TZ
   }
 );
+
 
 // ======================================================
 // INICIAR SERVIDOR
