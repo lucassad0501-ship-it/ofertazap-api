@@ -634,14 +634,17 @@ app.get("/api/products/manual", (_req, res) => {
 
 app.post("/api/products/manual", (req, res) => {
   const body = req.body || {};
-  const { id = randomUUID(), name, price, oldPrice = "", discount = "", category = "", link, message = "", imageData = "" } = body;
+  const { id = randomUUID(), name, price, oldPrice = "", discount = "", category = "", link, message = "", imageData = "", imageUrl = "" } = body;
   if (!name || !price || !link) {
     return res.status(400).json({ error: "name, price e link são obrigatórios" });
+  }
+  if (!imageData && !imageUrl) {
+    return res.status(400).json({ error: "Adicione imageData ou imageUrl para o produto." });
   }
   if (imageData && String(imageData).length > 4500000) {
     return res.status(413).json({ error: "Imagem muito grande. Reduza a imagem antes de salvar." });
   }
-  const product = { id: String(id), name: String(name), price: String(price), oldPrice: String(oldPrice || ""), discount: String(discount || ""), category: String(category || ""), link: String(link), message: String(message || ""), imageData: String(imageData || ""), createdAt: products.find(p => String(p.id) === String(id))?.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
+  const product = { id: String(id), name: String(name), price: String(price), oldPrice: String(oldPrice || ""), discount: String(discount || ""), category: String(category || ""), link: String(link), message: String(message || ""), imageData: String(imageData || ""), imageUrl: String(imageUrl || ""), createdAt: products.find(p => String(p.id) === String(id))?.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
   const index = products.findIndex(p => String(p.id) === String(id));
   if (index >= 0) products[index] = product; else products.unshift(product);
   saveJson(PRODUCTS_FILE, products);
