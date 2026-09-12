@@ -1,6 +1,6 @@
 {
-  "name": "ofertazap-api",
-  "version": "1.0.0",
+  "name": "ofertazap-saas-v32",
+  "version": "32.0.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -18,6 +18,7 @@
     "node-cron": "^4.2.1",
     "pino": "^9.10.0",
     "puppeteer": "^25.10.0",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "nodemailer": "^7.0.6"
   }
 }
