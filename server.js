@@ -15,6 +15,7 @@ import makeWASocket, {
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import puppeteer from "puppeteer";
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -265,6 +266,74 @@ async function resolveMercadoLivreItemId(value, accessToken) {
     }
   }
 
+  // 3) Navegador real (Chromium) para links meli.la que dependem de JavaScript/cookies.
+  // Isso segue o redirecionamento como um navegador e então valida o MLB na API oficial.
+  if (isShort) {
+    let browser = null;
+    try {
+      browser = await puppeteer.launch({
+        headless: true,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--no-first-run",
+          "--no-zygote"
+        ]
+      });
+      const page = await browser.newPage();
+      await page.setUserAgent(commonHeaders["user-agent"]);
+      await page.setExtraHTTPHeaders({
+        "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.7,en;q=0.6"
+      });
+      await page.setViewport({ width: 390, height: 844, isMobile: true });
+      await page.goto(original, { waitUntil: "domcontentloaded", timeout: 25000 });
+      try { await page.waitForNetworkIdle({ idleTime: 800, timeout: 10000 }); } catch {}
+
+      const finalUrl = page.url();
+      const browserData = await page.evaluate(() => ({
+        html: document.documentElement?.outerHTML || "",
+        title: document.title || "",
+        links: Array.from(document.querySelectorAll("a[href]"))
+          .map(a => a.href)
+          .filter(Boolean)
+          .slice(0, 300),
+        metas: Array.from(document.querySelectorAll("meta"))
+          .map(m => ({
+            name: m.getAttribute("name") || "",
+            property: m.getAttribute("property") || "",
+            content: m.getAttribute("content") || ""
+          }))
+          .slice(0, 300)
+      }));
+
+      const combined = [
+        finalUrl,
+        browserData.title,
+        browserData.html,
+        ...browserData.links,
+        ...browserData.metas.map(x => `${x.name} ${x.property} ${x.content}`)
+      ].join("\n");
+
+      const id = await findValidId(combined);
+      if (id) return id;
+
+      // Alguns links exibem o produto em JSON-LD ou scripts depois do primeiro carregamento.
+      const scripts = await page.evaluate(() =>
+        Array.from(document.scripts).map(s => s.textContent || "").join("\n")
+      );
+      const id2 = await findValidId(`${finalUrl}\n${scripts}`);
+      if (id2) return id2;
+    } catch (browserError) {
+      console.warn("[ML] navegador meli.la falhou:", browserError?.message || browserError);
+    } finally {
+      if (browser) {
+        try { await browser.close(); } catch {}
+      }
+    }
+  }
+
   // 3) Bridges de leitura para ambientes (como Render) onde meli.la pode bloquear fetch direto.
   if (isShort) {
     const bridges = [
@@ -354,15 +423,39 @@ async function getMercadoLivreProduct(value) {
         .filter(Boolean)
     : [];
 
+  // Usa o endpoint oficial de preço vencedor. Ele retorna amount (venda) e
+  // regular_amount (preço original quando há promoção).
+  let salePrice = null;
+  try {
+    const pr = await fetch(
+      `https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}/sale_price?context=channel_marketplace`,
+      { headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" } }
+    );
+    if (pr.status === 401) {
+      const refreshed = await refreshMercadoLivreToken();
+      accessToken = refreshed.access_token;
+    } else if (pr.ok) {
+      salePrice = await pr.json();
+    }
+  } catch {}
+
+  const currentPrice = salePrice?.amount ?? data.price ?? null;
+  const regularPrice = salePrice?.regular_amount ?? data.original_price ?? null;
+  const discount = (regularPrice != null && currentPrice != null && Number(regularPrice) > Number(currentPrice))
+    ? `${Math.round((1 - Number(currentPrice) / Number(regularPrice)) * 100)}% OFF`
+    : "";
+
   return {
     id: data.id,
     title: data.title || "",
-    price: data.price ?? null,
-    oldPrice: data.original_price ?? null,
-    currency: data.currency_id || "BRL",
+    price: currentPrice,
+    oldPrice: regularPrice,
+    discount,
+    currency: salePrice?.currency_id || data.currency_id || "BRL",
     image: pictures[0] || null,
     pictures,
-    permalink: data.permalink || null
+    permalink: data.permalink || null,
+    source: "Mercado Livre API oficial"
   };
 }
 
@@ -387,27 +480,65 @@ function extractPriceData(text) {
   const source = String(text || '');
   let current = null, old = null, discount = '';
 
-  // JSON-LD / campos comuns primeiro.
+  // 1) Campos estruturados/JSON.
   const jsonPrice = source.match(/"(?:price|sale_price|amount)"\s*:\s*"?([0-9]+(?:[.,][0-9]{1,2})?)/i);
-  const jsonOld = source.match(/"(?:highPrice|original_price|regular_amount)"\s*:\s*"?([0-9]+(?:[.,][0-9]{1,2})?)/i);
+  const jsonOld = source.match(/"(?:highPrice|original_price|regular_amount|compare_at_price)"\s*:\s*"?([0-9]+(?:[.,][0-9]{1,2})?)/i);
   if (jsonPrice) current = brlNumber(jsonPrice[1]);
   if (jsonOld) old = brlNumber(jsonOld[1]);
 
-  const money = source.match(/R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:,[0-9]{2})?)/gi) || [];
-  const nums = money.map(brlNumber).filter(v => v != null);
-  if (current == null && nums.length) current = nums[0];
+  // 2) Captura todos os valores em reais encontrados no HTML/texto.
+  const moneyMatches = source.match(/R\$\s*[0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|R\$\s*[0-9]+(?:,[0-9]{2})?/gi) || [];
+  const nums = [...new Set(moneyMatches.map(brlNumber).filter(v => v != null))];
 
-  const oldPatterns = [
-    /(?:de|antes|era|pre[cç]o\s*normal|pre[cç]o\s*original)[^R$]{0,80}R\$\s*([0-9.]+(?:,[0-9]{2})?)/i,
-    /R\$\s*([0-9.]+(?:,[0-9]{2})?)[^\n]{0,50}(?:de desconto|off|economize)/i
-  ];
-  if (old == null) {
-    for (const re of oldPatterns) { const m = source.match(re); if (m) { old = brlNumber(m[1]); break; } }
-  }
+  // 3) Descobre o percentual explícito, se existir.
   const dm = source.match(/(\d{1,3})\s*%\s*(?:OFF|desconto|de desconto)/i);
+  const discountPct = dm ? Number(dm[1]) : null;
   if (dm) discount = `${dm[1]}% OFF`;
-  if (!discount) discount = calcDiscount(old, current);
 
+  // 4) Tenta encontrar um par de preços que corresponda ao desconto.
+  // Isso resolve páginas onde o HTML mostra simplesmente: R$ 99,90 / R$ 149,90 / 33% OFF.
+  if (nums.length >= 2 && (current == null || old == null)) {
+    let best = null;
+    for (let i = 0; i < nums.length; i++) {
+      for (let j = i + 1; j < nums.length; j++) {
+        const a = nums[i], b = nums[j];
+        const lo = Math.min(a, b), hi = Math.max(a, b);
+        if (hi <= lo || hi <= 0) continue;
+        const pct = Math.round((1 - lo / hi) * 100);
+        if (discountPct != null && pct === discountPct) {
+          best = { price: lo, oldPrice: hi };
+          break;
+        }
+      }
+      if (best) break;
+    }
+    if (best) {
+      if (current == null) current = best.price;
+      if (old == null) old = best.oldPrice;
+    }
+  }
+
+  // 5) Se ainda não houver preço atual, usa o menor valor encontrado.
+  // O preço promocional normalmente é menor que o preço antigo.
+  if (current == null && nums.length) current = Math.min(...nums);
+  if (old == null && current != null) {
+    const larger = nums.filter(n => n > current);
+    if (larger.length) old = Math.max(...larger);
+  }
+
+  // 6) Padrões textuais ajudam quando há rótulos "de/por".
+  if (old == null) {
+    const oldPatterns = [
+      /(?:de|antes|era|pre[cç]o\s*normal|pre[cç]o\s*original)[^R$]{0,100}R\$\s*([0-9.]+(?:,[0-9]{2})?)/i,
+      /R\$\s*([0-9.]+(?:,[0-9]{2})?)[^\n]{0,80}(?:de desconto|off|economize)/i
+    ];
+    for (const re of oldPatterns) {
+      const m = source.match(re);
+      if (m) { old = brlNumber(m[1]); break; }
+    }
+  }
+
+  if (!discount) discount = calcDiscount(old, current);
   return { price: current, oldPrice: old, discount };
 }
 async function scrapePriceOnly(original) {
@@ -435,7 +566,9 @@ async function getPriceOnly(value) {
   const original = String(value || '').trim();
   if (!original) throw new Error('Informe o link da oferta.');
 
-  // 1) Se conseguirmos descobrir o MLB, usamos a API oficial de preços.
+  let apiData = null;
+
+  // 1) Se conseguirmos descobrir o MLB, consulta a API oficial de preços.
   try {
     const token = await getMercadoLivreAccessToken();
     const itemId = await resolveMercadoLivreItemId(original, token);
@@ -444,7 +577,9 @@ async function getPriceOnly(value) {
     });
     if (r.status === 401) {
       const fresh = await refreshMercadoLivreToken();
-      r = await fetch(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}/prices`, { headers:{ Authorization:`Bearer ${fresh.access_token}`, Accept:'application/json' } });
+      r = await fetch(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}/prices`, {
+        headers:{ Authorization:`Bearer ${fresh.access_token}`, Accept:'application/json' }
+      });
     }
     if (r.ok) {
       const d = await r.json();
@@ -453,13 +588,33 @@ async function getPriceOnly(value) {
       const standard = active.find(x => x.type === 'standard') || null;
       const price = promo?.amount ?? standard?.amount ?? null;
       const oldPrice = promo?.regular_amount ?? standard?.regular_amount ?? null;
-      return { price, oldPrice, discount: calcDiscount(oldPrice, price), itemId, source:'mercadolivre-api', link:original };
+      apiData = { price, oldPrice, discount: calcDiscount(oldPrice, price), itemId, source:'mercadolivre-api', link:original };
+
+      // Se já temos preço atual + preço antigo, não precisamos raspar a página.
+      if (price != null && oldPrice != null) return apiData;
     }
   } catch {}
 
-  // 2) Fallback: tenta ler apenas os valores da página/bridge, sem exigir MLB.
+  // 2) Fallback: lê os valores da página/bridge sem exigir que o MLB seja resolvido.
   const scraped = await scrapePriceOnly(original);
-  if (scraped.price != null || scraped.oldPrice != null || scraped.discount) return { ...scraped, link:original, source:'page' };
+  if (scraped.price != null || scraped.oldPrice != null || scraped.discount) {
+    const merged = {
+      price: apiData?.price ?? scraped.price,
+      oldPrice: apiData?.oldPrice ?? scraped.oldPrice,
+      discount: apiData?.discount || scraped.discount,
+      itemId: apiData?.itemId,
+      source: apiData ? 'mercadolivre-api+page' : 'page',
+      resolvedUrl: scraped.resolvedUrl,
+      link: original
+    };
+    if (!merged.discount) merged.discount = calcDiscount(merged.oldPrice, merged.price);
+    return merged;
+  }
+
+  if (apiData && (apiData.price != null || apiData.oldPrice != null || apiData.discount)) {
+    return apiData;
+  }
+
   throw new Error('Não consegui encontrar preço/desconto nesse link. Você pode informar o preço manualmente e manter o link de afiliado.');
 }
 
@@ -568,6 +723,25 @@ app.post("/api/products/preview", async (req, res) => {
     res.json({ ok: true, product });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+app.post("/api/mercadolivre/preco-link", async (req, res) => {
+  try {
+    const value = String(req.body?.link || req.body?.url || "").trim();
+    if (!value) return res.status(400).json({ ok: false, error: "Informe o link do Mercado Livre" });
+    const product = await getMercadoLivreProduct(value);
+    res.json({
+      ok: true,
+      link: value,
+      itemId: product.id,
+      price: product.price,
+      oldPrice: product.oldPrice,
+      discount: product.discount,
+      currency: product.currency
+    });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
   }
 });
 
