@@ -27,8 +27,8 @@ const ML_REDIRECT_URI = process.env.ML_REDIRECT_URI || "https://ofertazap-api1.o
 app.use(cors({ origin: process.env.FRONTEND_ORIGIN || "*" }));
 app.use(express.json({ limit: "5mb" }));
 
-const DATA_DIR = path.resolve("./data");
-const AUTH_DIR = path.resolve("./auth_info_baileys");
+const DATA_DIR = path.resolve(process.env.DATA_DIR || "./data");
+const AUTH_DIR = path.resolve(process.env.BAILEYS_AUTH_DIR || "./auth_info_baileys");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(AUTH_DIR, { recursive: true });
 
@@ -160,78 +160,149 @@ async function resolveMercadoLivreItemId(value, accessToken) {
     } catch { return null; }
   }
 
-  for (const id of extractMercadoLivreItemIds(original)) {
-    const valid = await validarItem(id);
-    if (valid) return valid.id;
+  function normalizarId(v) {
+    if (!v) return null;
+    return String(v).replace(/[-_\s]/g, '').toUpperCase();
   }
 
-  if (!/^https?:\/\//i.test(original)) throw new Error('Digite uma URL válida do Mercado Livre.');
-  let host = '';
-  try { host = new URL(original).hostname.toLowerCase(); } catch {}
-  const isShort = host === 'meli.la' || host.endsWith('.meli.la');
-
-  const candidates = [original];
-  const visited = new Set();
-
-  function addCandidate(v, baseUrl) {
-    if (!v) return;
-    let s = String(v).trim().replace(/&amp;/gi, '&').replace(/\\u0026/g, '&').replace(/\\\//g, '/');
-    try { if (!/^https?:\/\//i.test(s)) s = new URL(s, baseUrl).toString(); } catch {}
-    if (/^https?:\/\//i.test(s) && !candidates.includes(s)) candidates.push(s);
+  function extrairCandidatosProfundos(text) {
+    const raw = String(text || '');
+    const ids = new Set(extractMercadoLivreItemIds(raw));
+    const patterns = [
+      /(?:item[_-]?id|itemId|product[_-]?id|productId|catalog[_-]?product[_-]?id|catalogProductId|listing[_-]?id|listingId)\s*[:=]\s*["']?(MLB[-_]?\d{6,})["']?/gi,
+      /(?:\/p\/|\/MLB[-_]?)(MLB[-_]?\d{6,})/gi,
+      /\b(MLB[-_]?\d{6,})\b/gi
+    ];
+    for (const re of patterns) {
+      let m;
+      while ((m = re.exec(raw)) !== null) ids.add(normalizarId(m[1] || m[0]));
+    }
+    return [...ids].filter(Boolean);
   }
 
-  async function findId(text) {
-    for (const id of extractMercadoLivreItemIds(text)) {
+  async function findValidId(text) {
+    for (const id of extrairCandidatosProfundos(text)) {
       const valid = await validarItem(id);
       if (valid) return valid.id;
     }
     return null;
   }
 
-  for (let n = 0; n < 10; n++) {
+  // 1) Se o usuário já forneceu MLB..., não precisamos resolver encurtador.
+  const direct = await findValidId(original);
+  if (direct) return direct;
+
+  if (!/^https?:\/\//i.test(original)) throw new Error('Digite uma URL válida do Mercado Livre.');
+
+  let parsed;
+  try { parsed = new URL(original); } catch { throw new Error('Digite uma URL válida do Mercado Livre.'); }
+  const host = parsed.hostname.toLowerCase();
+  const isShort = host === 'meli.la' || host === 'www.meli.la' || host.endsWith('.meli.la');
+
+  const candidates = [];
+  const visited = new Set();
+  const queued = new Set();
+
+  function addCandidate(v, baseUrl = original) {
+    if (!v) return;
+    let s = String(v).trim()
+      .replace(/&amp;/gi, '&')
+      .replace(/\\u0026/g, '&')
+      .replace(/\\\//g, '/');
+    try {
+      if (!/^https?:\/\//i.test(s)) s = new URL(s, baseUrl).toString();
+    } catch {}
+    if (!/^https?:\/\//i.test(s)) return;
+    if (!queued.has(s)) { queued.add(s); candidates.push(s); }
+  }
+
+  addCandidate(original);
+  if (isShort && host !== 'www.meli.la') addCandidate(original.replace(/^https?:\/\/meli\.la/i, 'https://www.meli.la'));
+
+  const commonHeaders = {
+    'user-agent': 'Mozilla/5.0 (Linux; Android 13; SM-A515F) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36',
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'accept-language': 'pt-BR,pt;q=0.9,en-US;q=0.7,en;q=0.6',
+    'cache-control': 'no-cache',
+    'pragma': 'no-cache'
+  };
+
+  // 2) Resolve em múltiplos passos. Alguns meli.la caem em /social/ ou /sec/ antes do produto.
+  for (let n = 0; n < 16; n++) {
     const current = candidates.find(x => !visited.has(x));
     if (!current) break;
     visited.add(current);
-    try {
-      const r = await fetch(current, {
-        redirect: 'follow',
-        headers: {
-          'user-agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36',
-          accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'
+
+    for (const redirectMode of ['follow', 'manual']) {
+      try {
+        const r = await fetch(current, { redirect: redirectMode, headers: commonHeaders });
+        const location = r.headers.get('location') || '';
+        const html = await r.text();
+        const id = await findValidId(`${r.url || current}\n${location}\n${html}`);
+        if (id) return id;
+
+        addCandidate(r.url, current);
+        addCandidate(location, current);
+
+        const patterns = [
+          /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/gi,
+          /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/gi,
+          /<meta[^>]+property=["']og:product:url["'][^>]+content=["']([^"']+)["']/gi,
+          /<meta[^>]+name=["']twitter:url["'][^>]+content=["']([^"']+)["']/gi,
+          /<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']/gi,
+          /(?:window\.)?location(?:\.href|\.replace|\.assign)?\s*(?:=|\()\s*["']([^"']+)["']/gi,
+          /(?:href|url|link|deeplink|redirect|destination|target)["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/gi
+        ];
+        for (const re of patterns) {
+          let m;
+          while ((m = re.exec(html)) !== null) addCandidate(m[1], current);
         }
-      });
-      const html = await r.text();
-      const id = await findId(`${r.url || current}\n${r.headers.get('location') || ''}\n${html}`);
-      if (id) return id;
-      addCandidate(r.url, current);
-      addCandidate(r.headers.get('location'), current);
-      const patterns = [
-        /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/gi,
-        /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/gi,
-        /<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']/gi,
-        /(?:window\.)?location(?:\.href|\.replace|\.assign)?\s*(?:=|\()\s*["']([^"']+)["']/gi
-      ];
-      for (const re of patterns) {
-        let m;
-        while ((m=re.exec(html))!==null) addCandidate(m[1], current);
-      }
-    } catch {}
+
+        // Extrai URLs completas e, principalmente, dados embutidos de item_id/product_id.
+        const urls = html.match(/https?:\/\/[^\s<>"'\\]+/gi) || [];
+        for (const u of urls.slice(0, 100)) addCandidate(u, current);
+      } catch {}
+    }
   }
 
+  // 3) Bridges de leitura para ambientes (como Render) onde meli.la pode bloquear fetch direto.
   if (isShort) {
-    for (const proxy of [`https://r.jina.ai/${original}`, `https://r.jina.ai/http://${original.replace(/^https?:\/\//i,'')}`]) {
+    const bridges = [
+      `https://r.jina.ai/${original}`,
+      `https://r.jina.ai/http://${original.replace(/^https?:\/\//i, '')}`,
+      `https://r.jina.ai/https://www.meli.la/${parsed.pathname.replace(/^\//, '')}`
+    ];
+
+    for (const bridge of bridges) {
       try {
-        const r = await fetch(proxy, { redirect:'follow', headers:{'user-agent':'OfertaZap/1.0',accept:'text/plain,text/html,*/*;q=0.8'} });
+        const r = await fetch(bridge, {
+          redirect: 'follow',
+          headers: { ...commonHeaders, 'user-agent': 'Mozilla/5.0 OfertaZap/17.0' }
+        });
         const text = await r.text();
-        const id = await findId(`${r.url || proxy}\n${text}`);
+        const id = await findValidId(`${r.url || bridge}\n${text}`);
         if (id) return id;
-        const urls = text.match(/https?:\/\/[^\s<>"')]+/gi) || [];
-        for (const u of urls.slice(0,40)) {
-          const id2 = await findId(u);
-          if (id2) return id2;
+
+        const urls = text.match(/https?:\/\/[^\s<>"'\\]+/gi) || [];
+        for (const u of urls.slice(0, 100)) {
+          addCandidate(u, bridge);
         }
       } catch {}
     }
+
+    // Tenta novamente as URLs descobertas pelas bridges, mas ainda valida tudo na API oficial.
+    for (let n = 0; n < 12; n++) {
+      const current = candidates.find(x => !visited.has(x));
+      if (!current) break;
+      visited.add(current);
+      try {
+        const r = await fetch(current, { redirect: 'follow', headers: commonHeaders });
+        const html = await r.text();
+        const id = await findValidId(`${r.url || current}\n${r.headers.get('location') || ''}\n${html}`);
+        if (id) return id;
+      } catch {}
+    }
+
     throw new Error('Não consegui resolver o link curto meli.la agora. Seu link de afiliado será preservado. Tente novamente em alguns segundos.');
   }
 
@@ -332,7 +403,7 @@ app.get("/", (_req, res) => {
 
 // Health é público e fica ANTES da proteção por token.
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, service: "OfertaZap API", time: new Date().toISOString() });
+  res.json({ ok: true, service: "OfertaZap API", version: "V17-MELILA-RESOLVER", time: new Date().toISOString() });
 });
 
 // ======================================================
@@ -389,6 +460,18 @@ app.post("/api/products/preview", async (req, res) => {
     res.json({ ok: true, product });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+app.post("/api/mercadolivre/resolve", async (req, res) => {
+  try {
+    const value = String(req.body?.link || req.body?.url || "").trim();
+    if (!value) return res.status(400).json({ ok: false, error: "Informe o link do Mercado Livre" });
+    const accessToken = await getMercadoLivreAccessToken();
+    const itemId = await resolveMercadoLivreItemId(value, accessToken);
+    res.json({ ok: true, itemId, originalLink: value });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
   }
 });
 
