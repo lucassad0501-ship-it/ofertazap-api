@@ -28,7 +28,7 @@ app.use(cors({ origin: process.env.FRONTEND_ORIGIN || "*" }));
 app.use(express.json({ limit: "5mb" }));
 
 const DATA_DIR = path.resolve("./data");
-const AUTH_DIR = path.resolve("./auth_info_baileys");
+const AUTH_DIR = process.env.BAILEYS_AUTH_DIR || path.resolve("./auth_info_baileys");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(AUTH_DIR, { recursive: true });
 
@@ -58,6 +58,14 @@ let connectionState = "disconnected";
 let lastError = null;
 let mlOAuthState = null;
 let mlTokens = loadJson(ML_TOKEN_FILE, {});
+
+function hasWhatsAppAuth() {
+  try {
+    return fs.existsSync(AUTH_DIR) && fs.readdirSync(AUTH_DIR).some(name =>
+      /^(creds\.json|app-state-sync-key|app-state-sync-version|session|sender-key|pre-key|lid-mapping)/i.test(name)
+    );
+  } catch { return false; }
+}
 
 
 function requireMercadoLivreConfig() {
@@ -482,7 +490,7 @@ async function startWhatsApp() {
         setTimeout(() => startWhatsApp().catch(err => {
           lastError = err.message;
           connectionState = "disconnected";
-        }), 5000);
+        }), 3000);
       }
     }
   });
@@ -710,7 +718,17 @@ cron.schedule("* * * * *", () => {
   processJobs().catch(err => console.error("Scheduler:", err.message));
 }, { timezone: TZ });
 
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, "0.0.0.0", async () => {
   console.log(`OfertaZap API rodando na porta ${PORT}`);
   console.log(`Timezone: ${TZ}`);
+  console.log(`WhatsApp auth dir: ${AUTH_DIR}`);
+  console.log(`WhatsApp sessão salva: ${hasWhatsAppAuth() ? "sim" : "não"}`);
+  try {
+    await startWhatsApp();
+    console.log("WhatsApp inicialização automática solicitada.");
+  } catch (err) {
+    lastError = err.message;
+    connectionState = "disconnected";
+    console.error("Falha ao iniciar WhatsApp automaticamente:", err.message);
+  }
 });
