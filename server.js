@@ -28,7 +28,7 @@ app.use(cors({ origin: process.env.FRONTEND_ORIGIN || "*" }));
 app.use(express.json({ limit: "5mb" }));
 
 const DATA_DIR = path.resolve("./data");
-const AUTH_DIR = process.env.BAILEYS_AUTH_DIR || path.resolve("./auth_info_baileys");
+const AUTH_DIR = path.resolve("./auth_info_baileys");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(AUTH_DIR, { recursive: true });
 
@@ -58,14 +58,6 @@ let connectionState = "disconnected";
 let lastError = null;
 let mlOAuthState = null;
 let mlTokens = loadJson(ML_TOKEN_FILE, {});
-
-function hasWhatsAppAuth() {
-  try {
-    return fs.existsSync(AUTH_DIR) && fs.readdirSync(AUTH_DIR).some(name =>
-      /^(creds\.json|app-state-sync-key|app-state-sync-version|session|sender-key|pre-key|lid-mapping)/i.test(name)
-    );
-  } catch { return false; }
-}
 
 
 function requireMercadoLivreConfig() {
@@ -159,120 +151,92 @@ async function resolveMercadoLivreItemId(value, accessToken) {
 
   async function validarItem(itemId) {
     try {
-      const response = await fetch(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, {
+      const r = await fetch(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, {
         headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' }
       });
-      if (!response.ok) return null;
-      const data = await response.json();
+      if (!r.ok) return null;
+      const data = await r.json();
       return data?.id ? data : null;
     } catch { return null; }
   }
 
-  // Se o link já contém MLB, valida diretamente.
   for (const id of extractMercadoLivreItemIds(original)) {
     const valid = await validarItem(id);
     if (valid) return valid.id;
   }
 
-  if (!/^https?:\/\//i.test(original)) {
-    throw new Error('Digite uma URL válida do Mercado Livre.');
-  }
+  if (!/^https?:\/\//i.test(original)) throw new Error('Digite uma URL válida do Mercado Livre.');
+  let host = '';
+  try { host = new URL(original).hostname.toLowerCase(); } catch {}
+  const isShort = host === 'meli.la' || host.endsWith('.meli.la');
 
   const candidates = [original];
   const visited = new Set();
-  let lastNetworkError = null;
 
-  function addCandidate(valueToAdd, base = original) {
-    if (!valueToAdd) return;
-    let text = String(valueToAdd).trim();
-    text = text.replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/gi, '&');
-    try {
-      if (base && !/^https?:\/\//i.test(text)) text = new URL(text, base).toString();
-    } catch {}
-    if (text && !candidates.includes(text)) candidates.push(text);
+  function addCandidate(v, baseUrl) {
+    if (!v) return;
+    let s = String(v).trim().replace(/&amp;/gi, '&').replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+    try { if (!/^https?:\/\//i.test(s)) s = new URL(s, baseUrl).toString(); } catch {}
+    if (/^https?:\/\//i.test(s) && !candidates.includes(s)) candidates.push(s);
   }
 
-  async function inspectUrl(url) {
-    const headersList = [
-      {
-        'user-agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36',
-        accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
-        'accept-language': 'pt-BR,pt;q=0.9,en;q=0.8'
-      },
-      {
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-        accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'
-      }
-    ];
-
-    for (const headers of headersList) {
-      for (const redirect of ['follow', 'manual']) {
-        try {
-          const response = await fetch(url, { redirect, headers });
-          addCandidate(response.url || url, url);
-          const location = response.headers.get('location');
-          if (location) addCandidate(location, url);
-          let html = '';
-          try { html = await response.text(); } catch {}
-          return { response, html };
-        } catch (err) {
-          lastNetworkError = err;
-        }
-      }
+  async function findId(text) {
+    for (const id of extractMercadoLivreItemIds(text)) {
+      const valid = await validarItem(id);
+      if (valid) return valid.id;
     }
     return null;
   }
 
-  for (let step = 0; step < 12; step++) {
-    if (visited.has(original)) break;
-    const current = candidates.find(x => !visited.has(x) && /^https?:\/\//i.test(x));
+  for (let n = 0; n < 10; n++) {
+    const current = candidates.find(x => !visited.has(x));
     if (!current) break;
     visited.add(current);
-
-    const result = await inspectUrl(current);
-    if (!result) continue;
-
-    const { response, html } = result;
-    const location = response.headers.get('location');
-    if (location) addCandidate(location, current);
-
-    const patterns = [
-      /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/gi,
-      /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/gi,
-      /(?:canonical|og:url)[^>]+(?:href|content)=["']([^"']+)["']/gi,
-      /<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']/gi,
-      /(?:window\.)?location(?:\.href|\.replace|\.assign)?\s*(?:=|\()\s*["']([^"']+)["']/gi,
-      /https?:\\?\/\\?\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+/gi
-    ];
-
-    for (const regex of patterns) {
-      let match;
-      while ((match = regex.exec(html)) !== null) addCandidate(match[1] || match[0], current);
-    }
-
-    const ids = [];
-    for (const candidate of candidates) {
-      for (const id of extractMercadoLivreItemIds(candidate)) {
-        if (!ids.includes(id)) ids.push(id);
+    try {
+      const r = await fetch(current, {
+        redirect: 'follow',
+        headers: {
+          'user-agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36',
+          accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'
+        }
+      });
+      const html = await r.text();
+      const id = await findId(`${r.url || current}\n${r.headers.get('location') || ''}\n${html}`);
+      if (id) return id;
+      addCandidate(r.url, current);
+      addCandidate(r.headers.get('location'), current);
+      const patterns = [
+        /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/gi,
+        /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/gi,
+        /<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']/gi,
+        /(?:window\.)?location(?:\.href|\.replace|\.assign)?\s*(?:=|\()\s*["']([^"']+)["']/gi
+      ];
+      for (const re of patterns) {
+        let m;
+        while ((m=re.exec(html))!==null) addCandidate(m[1], current);
       }
-    }
-
-    for (const id of ids) {
-      const valid = await validarItem(id);
-      if (valid) {
-        console.log(`[Mercado Livre] Item válido encontrado: ${valid.id}`);
-        return valid.id;
-      }
-    }
+    } catch {}
   }
 
-  if (lastNetworkError) {
-    throw new Error('O servidor não conseguiu acessar o link meli.la. Tente novamente ou use o link completo do anúncio do Mercado Livre.');
+  if (isShort) {
+    for (const proxy of [`https://r.jina.ai/${original}`, `https://r.jina.ai/http://${original.replace(/^https?:\/\//i,'')}`]) {
+      try {
+        const r = await fetch(proxy, { redirect:'follow', headers:{'user-agent':'OfertaZap/1.0',accept:'text/plain,text/html,*/*;q=0.8'} });
+        const text = await r.text();
+        const id = await findId(`${r.url || proxy}\n${text}`);
+        if (id) return id;
+        const urls = text.match(/https?:\/\/[^\s<>"')]+/gi) || [];
+        for (const u of urls.slice(0,40)) {
+          const id2 = await findId(u);
+          if (id2) return id2;
+        }
+      } catch {}
+    }
+    throw new Error('Não consegui resolver o link curto meli.la agora. Seu link de afiliado será preservado. Tente novamente em alguns segundos.');
   }
 
   throw new Error('Não consegui encontrar um anúncio válido do Mercado Livre nesse link.');
 }
-
 // ======================================================
 // MERCADO LIVRE - BUSCAR PRODUTO
 // ======================================================
@@ -490,7 +454,7 @@ async function startWhatsApp() {
         setTimeout(() => startWhatsApp().catch(err => {
           lastError = err.message;
           connectionState = "disconnected";
-        }), 3000);
+        }), 5000);
       }
     }
   });
@@ -718,17 +682,7 @@ cron.schedule("* * * * *", () => {
   processJobs().catch(err => console.error("Scheduler:", err.message));
 }, { timezone: TZ });
 
-app.listen(PORT, "0.0.0.0", async () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`OfertaZap API rodando na porta ${PORT}`);
   console.log(`Timezone: ${TZ}`);
-  console.log(`WhatsApp auth dir: ${AUTH_DIR}`);
-  console.log(`WhatsApp sessão salva: ${hasWhatsAppAuth() ? "sim" : "não"}`);
-  try {
-    await startWhatsApp();
-    console.log("WhatsApp inicialização automática solicitada.");
-  } catch (err) {
-    lastError = err.message;
-    connectionState = "disconnected";
-    console.error("Falha ao iniciar WhatsApp automaticamente:", err.message);
-  }
 });
