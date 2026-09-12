@@ -366,6 +366,103 @@ async function getMercadoLivreProduct(value) {
   };
 }
 
+// ======================================================
+// PREÇO/DESCONTO POR LINK — SEM DEPENDER DA IMAGEM
+// ======================================================
+function brlNumber(value) {
+  if (value == null) return null;
+  const s = String(value).replace(/\s/g, '').replace(/R\$/i, '').replace(/\./g, '').replace(',', '.');
+  const n = Number(s.replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+function formatMoneyBR(n) {
+  if (n == null || !Number.isFinite(Number(n))) return '';
+  return Number(n).toLocaleString('pt-BR', { style:'currency', currency:'BRL' });
+}
+function calcDiscount(oldPrice, price) {
+  if (oldPrice == null || price == null || oldPrice <= 0 || price >= oldPrice) return '';
+  return `${Math.round((1 - price / oldPrice) * 100)}% OFF`;
+}
+function extractPriceData(text) {
+  const source = String(text || '');
+  let current = null, old = null, discount = '';
+
+  // JSON-LD / campos comuns primeiro.
+  const jsonPrice = source.match(/"(?:price|sale_price|amount)"\s*:\s*"?([0-9]+(?:[.,][0-9]{1,2})?)/i);
+  const jsonOld = source.match(/"(?:highPrice|original_price|regular_amount)"\s*:\s*"?([0-9]+(?:[.,][0-9]{1,2})?)/i);
+  if (jsonPrice) current = brlNumber(jsonPrice[1]);
+  if (jsonOld) old = brlNumber(jsonOld[1]);
+
+  const money = source.match(/R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:,[0-9]{2})?)/gi) || [];
+  const nums = money.map(brlNumber).filter(v => v != null);
+  if (current == null && nums.length) current = nums[0];
+
+  const oldPatterns = [
+    /(?:de|antes|era|pre[cç]o\s*normal|pre[cç]o\s*original)[^R$]{0,80}R\$\s*([0-9.]+(?:,[0-9]{2})?)/i,
+    /R\$\s*([0-9.]+(?:,[0-9]{2})?)[^\n]{0,50}(?:de desconto|off|economize)/i
+  ];
+  if (old == null) {
+    for (const re of oldPatterns) { const m = source.match(re); if (m) { old = brlNumber(m[1]); break; } }
+  }
+  const dm = source.match(/(\d{1,3})\s*%\s*(?:OFF|desconto|de desconto)/i);
+  if (dm) discount = `${dm[1]}% OFF`;
+  if (!discount) discount = calcDiscount(old, current);
+
+  return { price: current, oldPrice: old, discount };
+}
+async function scrapePriceOnly(original) {
+  const parsed = new URL(original);
+  const candidates = [original];
+  if (parsed.hostname === 'meli.la' || parsed.hostname === 'www.meli.la') {
+    candidates.push(`https://www.meli.la${parsed.pathname}${parsed.search}`);
+  }
+  const bridges = [
+    `https://r.jina.ai/${original}`,
+    `https://r.jina.ai/http://${original.replace(/^https?:\/\//i,'')}`,
+    `https://r.jina.ai/https://www.meli.la${parsed.pathname}${parsed.search}`
+  ];
+  for (const url of [...candidates, ...bridges]) {
+    try {
+      const r = await fetch(url, { redirect:'follow', headers:{'user-agent':'Mozilla/5.0 OfertaZap/20.0','accept':'text/html,application/json,text/plain,*/*'} });
+      const text = await r.text();
+      const data = extractPriceData(`${r.url || url}\n${text}`);
+      if (data.price != null || data.oldPrice != null || data.discount) return { ...data, source:url, resolvedUrl:r.url || url };
+    } catch {}
+  }
+  return { price:null, oldPrice:null, discount:'' };
+}
+async function getPriceOnly(value) {
+  const original = String(value || '').trim();
+  if (!original) throw new Error('Informe o link da oferta.');
+
+  // 1) Se conseguirmos descobrir o MLB, usamos a API oficial de preços.
+  try {
+    const token = await getMercadoLivreAccessToken();
+    const itemId = await resolveMercadoLivreItemId(original, token);
+    let r = await fetch(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}/prices`, {
+      headers:{ Authorization:`Bearer ${token}`, Accept:'application/json' }
+    });
+    if (r.status === 401) {
+      const fresh = await refreshMercadoLivreToken();
+      r = await fetch(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}/prices`, { headers:{ Authorization:`Bearer ${fresh.access_token}`, Accept:'application/json' } });
+    }
+    if (r.ok) {
+      const d = await r.json();
+      const active = (Array.isArray(d.prices) ? d.prices : []).filter(x => x && x.amount != null);
+      const promo = active.find(x => x.type === 'promotion') || null;
+      const standard = active.find(x => x.type === 'standard') || null;
+      const price = promo?.amount ?? standard?.amount ?? null;
+      const oldPrice = promo?.regular_amount ?? standard?.regular_amount ?? null;
+      return { price, oldPrice, discount: calcDiscount(oldPrice, price), itemId, source:'mercadolivre-api', link:original };
+    }
+  } catch {}
+
+  // 2) Fallback: tenta ler apenas os valores da página/bridge, sem exigir MLB.
+  const scraped = await scrapePriceOnly(original);
+  if (scraped.price != null || scraped.oldPrice != null || scraped.discount) return { ...scraped, link:original, source:'page' };
+  throw new Error('Não consegui encontrar preço/desconto nesse link. Você pode informar o preço manualmente e manter o link de afiliado.');
+}
+
 // OAuth callback é público porque o Mercado Livre redireciona o navegador para esta rota.
 app.get("/api/mercadolivre/callback", async (req, res) => {
   try {
@@ -449,6 +546,17 @@ app.get("/api/mercadolivre/status", (_req, res) => {
     userId: mlTokens.user_id || null,
     expiresAt: mlTokens.savedAt ? new Date(new Date(mlTokens.savedAt).getTime() + Number(mlTokens.expires_in || 21600) * 1000).toISOString() : null
   });
+});
+
+app.post("/api/products/price-preview", async (req, res) => {
+  try {
+    const value = String(req.body?.link || req.body?.url || "").trim();
+    if (!value) return res.status(400).json({ ok:false, error:"Informe o link da oferta" });
+    const price = await getPriceOnly(value);
+    res.json({ ok:true, price });
+  } catch (err) {
+    res.status(400).json({ ok:false, error:err.message });
+  }
 });
 
 app.post("/api/products/preview", async (req, res) => {
