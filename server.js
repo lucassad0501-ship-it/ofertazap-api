@@ -28,8 +28,9 @@ const ML_REDIRECT_URI = process.env.ML_REDIRECT_URI || "https://ofertazap-api1.o
 app.use(cors({ origin: process.env.FRONTEND_ORIGIN || "*" }));
 app.use(express.json({ limit: "5mb" }));
 
-const DATA_DIR = path.resolve(process.env.DATA_DIR || "./data");
-const AUTH_DIR = path.resolve(process.env.BAILEYS_AUTH_DIR || "./auth_info_baileys");
+const PERSISTENT_ROOT = process.env.RENDER_DISK_ROOT || (fs.existsSync("/data") ? "/data" : null);
+const DATA_DIR = path.resolve(process.env.DATA_DIR || (PERSISTENT_ROOT ? path.join(PERSISTENT_ROOT, "ofertazap") : "./data"));
+const AUTH_DIR = path.resolve(process.env.BAILEYS_AUTH_DIR || path.join(DATA_DIR, "auth_info_baileys"));
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(AUTH_DIR, { recursive: true });
 
@@ -47,7 +48,9 @@ function loadJson(file, fallback = []) {
   }
 }
 function saveJson(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
+  fs.renameSync(tmp, file);
 }
 
 let groups = loadJson(GROUPS_FILE, []);
@@ -685,6 +688,10 @@ app.get("/api/mercadolivre/auth", (req, res) => {
 
 
 // Todas as outras rotas /api exigem API_TOKEN.
+app.get("/api/persistence", (_req, res) => {
+  res.json({ ok: true, persistentRoot: PERSISTENT_ROOT || null, dataDir: DATA_DIR, authDir: AUTH_DIR, whatsappAuthFiles: fs.existsSync(AUTH_DIR) ? fs.readdirSync(AUTH_DIR).length : 0, mercadoLivreTokenSaved: Boolean(mlTokens?.refresh_token), groups: groups.length, jobs: jobs.length, products: products.length });
+});
+
 app.use("/api", authMiddleware);
 
 app.get("/api/mercadolivre/status", (_req, res) => {
@@ -1053,4 +1060,8 @@ cron.schedule("* * * * *", () => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`OfertaZap API rodando na porta ${PORT}`);
   console.log(`Timezone: ${TZ}`);
+  console.log(`DATA_DIR: ${DATA_DIR}`);
+  console.log(`BAILEYS_AUTH_DIR: ${AUTH_DIR}`);
+  console.log(`Persistência Render: ${PERSISTENT_ROOT ? "ATIVA" : "NÃO detectada"}`);
+  startWhatsApp().catch(err => { lastError = err.message; connectionState = "disconnected"; console.error("Falha ao iniciar WhatsApp automaticamente:", err.message); });
 });
