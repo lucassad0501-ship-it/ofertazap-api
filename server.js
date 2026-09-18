@@ -136,3 +136,4 @@ await initPersistence();
 ensureMaster();
 if(pool) await persistState();
 app.listen(PORT,'0.0.0.0',()=>{console.log(`OfertaZap SaaS V38 na porta ${PORT}`);console.log(`DATA_DIR=${ROOT}`);console.log(`AUTH_ROOT=${AUTH_ROOT}`);console.log(`POSTGRES=${pool?'connected':'not configured'}`);for(const u of db.users.filter(x=>x.role==='CLIENT'&&x.active!==false)){if(activeSub(u.id))startWA(u.id).catch(e=>console.error('WA',u.id,e.message))}});
+
