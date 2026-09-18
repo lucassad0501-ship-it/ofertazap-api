@@ -1,20 +1,24 @@
 {
-  "name": "ofertazap-saas-dual-painel",
-  "version": "34.0.0",
+  "name": "ofertazap-saas",
+  "version": "34.1.0",
+  "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "@hapi/boom": "^10.0.4",
-    "@whiskeysockets/baileys": "latest",
-    "cors": "latest",
-    "dotenv": "latest",
-    "express": "latest",
-    "node-cron": "latest",
-    "nodemailer": "latest",
-    "pino": "latest",
-    "puppeteer": "latest",
-    "qrcode": "latest"
+    "@hapi/boom": "10.0.1",
+    "@whiskeysockets/baileys": "6.7.24",
+    "cors": "2.8.5",
+    "dotenv": "16.6.1",
+    "express": "5.1.0",
+    "node-cron": "4.2.1",
+    "nodemailer": "7.0.6",
+    "pino": "9.9.4",
+    "puppeteer": "24.22.3",
+    "qrcode": "1.5.4"
   }
 }
