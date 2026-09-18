@@ -1,6 +1,6 @@
 {
   "name": "ofertazap-saas-dual-painel",
-  "version": "33.0.0",
+  "version": "34.0.0",
   "type": "module",
   "scripts": {
     "start": "node server.js"
@@ -15,7 +15,6 @@
     "nodemailer": "latest",
     "pino": "latest",
     "puppeteer": "latest",
-    "qrcode": "latest",
-    "pg": "^8.16.3"
+    "qrcode": "latest"
   }
 }
