@@ -11,8 +11,6 @@ import { Boom } from '@hapi/boom';
 import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import puppeteer from 'puppeteer';
 import nodemailer from 'nodemailer';
-import pg from 'pg';
-const { Pool } = pg;
 
 const app=express();
 const PORT=Number(process.env.PORT||3000), TZ=process.env.TZ||'America/Sao_Paulo';
@@ -22,7 +20,6 @@ const MASTER_PASSWORD=process.env.MASTER_PASSWORD||'';
 const JWT_SECRET=process.env.JWT_SECRET||API_TOKEN||'change-this-secret';
 const ROOT=path.resolve(process.env.DATA_DIR||((fs.existsSync('/data'))?'/data/ofertazap':'./data'));
 const AUTH_ROOT=path.resolve(process.env.BAILEYS_AUTH_ROOT||path.join(ROOT,'clientes'));
-const pool=process.env.DATABASE_URL?new Pool({connectionString:process.env.DATABASE_URL,ssl:String(process.env.DATABASE_SSL||'true')==='true'?{rejectUnauthorized:false}:false}):null;
 fs.mkdirSync(ROOT,{recursive:true});fs.mkdirSync(AUTH_ROOT,{recursive:true});
 app.use(cors({origin:process.env.FRONTEND_ORIGIN||'*'}));app.use(express.json({limit:'6mb'}));
 const files={db:path.join(ROOT,'saas.json'),products:path.join(ROOT,'products.json'),jobs:path.join(ROOT,'jobs.json'),groups:path.join(ROOT,'groups.json'),templates:path.join(ROOT,'templates.json'),logs:path.join(ROOT,'logs.json')};
@@ -37,11 +34,7 @@ const defaultTemplates=[
 {id:'t3',name:'💥 Promoção do dia',text:'💥 PROMOÇÃO DO DIA!\n\n{produto}\n🔥 {preco}\n🏷️ {desconto} OFF\n\n👉 Confira:\n{link}'}];
 let db=load(files.db,defaultDb),products=load(files.products,[]),jobs=load(files.jobs,[]),groups=load(files.groups,[]),templates=load(files.templates,defaultTemplates),logs=load(files.logs,[]);
 const wa=new Map();
-let dbReady=false;
-function snapshot(){return {db,products,jobs,groups,templates,logs};}
-async function persistState(){if(!pool)return;await pool.query(`INSERT INTO app_state(id,state,updated_at) VALUES(1,$1::jsonb,NOW()) ON CONFLICT(id) DO UPDATE SET state=EXCLUDED.state,updated_at=NOW()`,[JSON.stringify(snapshot())]);}
-function save(f,d){const t=f+'.tmp';fs.writeFileSync(t,JSON.stringify(d,null,2));fs.renameSync(t,f);if(dbReady&&pool)persistState().catch(e=>console.error('PostgreSQL:',e.message));}
-async function initPersistence(){if(!pool)return;await pool.query(`CREATE TABLE IF NOT EXISTS app_state(id INTEGER PRIMARY KEY,state JSONB NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);const r=await pool.query('SELECT state FROM app_state WHERE id=1');if(r.rows[0]?.state){const x=r.rows[0].state;db=x.db||defaultDb;products=x.products||[];jobs=x.jobs||[];groups=x.groups||[];templates=x.templates||defaultTemplates;logs=x.logs||[];save(files.db,db);save(files.products,products);save(files.jobs,jobs);save(files.groups,groups);save(files.templates,templates);save(files.logs,logs);console.log('PostgreSQL carregado: dados restaurados.')}else{await persistState();console.log('PostgreSQL inicializado: dados JSON migrados para o banco.')}dbReady=true;}
+function save(f,d){const t=f+'.tmp';fs.writeFileSync(t,JSON.stringify(d,null,2));fs.renameSync(t,f);}
 function log(action,userId,meta={}){logs.unshift({id:crypto.randomUUID(),at:new Date().toISOString(),action,userId,meta});logs=logs.slice(0,2000);save(files.logs,logs)}
 function ensureMaster(){if(!MASTER_LOGIN||!MASTER_PASSWORD)throw Error('MASTER_LOGIN e MASTER_PASSWORD precisam estar configurados nas variáveis do Render.');let u=db.users.find(x=>x.role==='MASTER');if(!u){const salt=crypto.randomBytes(16).toString('hex');db.users.push({id:'master',role:'MASTER',name:'Administrador Master',email:MASTER_LOGIN,passwordHash:hash(MASTER_PASSWORD,salt),salt,active:true,createdAt:new Date().toISOString()});save(files.db,db)}else if(u.email!==MASTER_LOGIN){u.email=MASTER_LOGIN;const salt=crypto.randomBytes(16).toString('hex');u.passwordHash=hash(MASTER_PASSWORD,salt);u.salt=salt;u.active=true;save(files.db,db)}}
 function hash(p,s){return crypto.scryptSync(String(p),s,64).toString('hex')}
@@ -66,9 +59,8 @@ for(let n=0;n<10&&candidates.length;n++){const u=candidates[n];try{const r=await
 if(/^https?:\/\/(www\.)?meli\.la/i.test(link)){let browser;try{browser=await puppeteer.launch({headless:true,args:['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage']});const page=await browser.newPage();await page.setViewport({width:390,height:844,isMobile:true});await page.goto(link,{waitUntil:'domcontentloaded',timeout:25000});try{await page.waitForNetworkIdle({idleTime:800,timeout:8000})}catch{}const data=await page.evaluate(()=>({url:location.href,html:document.documentElement.outerHTML}));for(const id of itemIds(data.url+'\n'+data.html)){try{return await mlItem(id)}catch{}}}finally{if(browser)await browser.close()}}
 throw Error('Não consegui identificar o anúncio Mercado Livre neste link.')}
 
-await initPersistence();
+
 ensureMaster();
-if(pool)await persistState();
 app.get('/api/health',(_,res)=>res.json({ok:true,service:'OfertaZap SaaS V32',time:new Date().toISOString()}));
 app.get('/api/config/public',(_,res)=>res.json({ok:true,brand:db.settings.brand,plans:db.plans.map(({id,name,limit,price})=>({id,name,limit,price}))}));
 app.post('/api/auth/register',async(req,res)=>{try{const {name,email,password,company,phone}=req.body||{};if(!name||!email||!password||!phone)throw Error('Nome, e-mail, senha e celular são obrigatórios');const cleanPhone=String(phone).replace(/\D/g,'');if(cleanPhone.length<10||cleanPhone.length>15)throw Error('Número de celular inválido');const e=email.toLowerCase().trim();if(db.users.some(u=>u.email===e))throw Error('E-mail já cadastrado');const salt=crypto.randomBytes(16).toString('hex'),id=crypto.randomUUID();db.users.push({id,role:'CLIENT',name,email:e,company:company||'',phone:cleanPhone,passwordHash:hash(password,salt),salt,active:true,emailVerified:true,createdAt:new Date().toISOString()});save(files.db,db);log('client_registered',id);res.json({ok:true,message:'Cadastro criado com sucesso. Você já pode entrar.',verificationRequired:false})}catch(e){res.status(400).json({error:e.message})}});
