@@ -107,14 +107,82 @@ function extractInviteCode(value){const m=String(value||'').match(/chat\.whatsap
 app.post('/api/groups',async(req,res)=>{try{const name=String(req.body?.name||'').trim(),inviteLink=String(req.body?.inviteLink||'').trim(),jid=String(req.body?.jid||'').trim();if(!name)throw Error('Informe o nome do grupo');if(!inviteLink&&!jid)throw Error('Informe o link de convite do grupo');let groupJid=jid||'',groupName=name;const x=wa.get(req.user.id);if(!groupJid&&inviteLink&&x?.sock){const code=extractInviteCode(inviteLink);if(!code)throw Error('Link de convite inválido');try{const info=await x.sock.groupGetInviteInfo(code);groupJid=info.id;groupName=name||info.subject||groupName}catch(e){throw Error('Não foi possível identificar o grupo pelo link: '+e.message)}}const duplicate=groups.find(g=>g.userId===req.user.id&&((groupJid&&g.jid===groupJid)||(inviteLink&&g.inviteLink===inviteLink)));if(duplicate)return res.status(409).json({error:'Este grupo já está cadastrado.'});const g={id:crypto.randomUUID(),userId:req.user.id,name:groupName,jid:groupJid,inviteLink:inviteLink||'',enabled:true,status:groupJid?'connected':'pending',createdAt:new Date().toISOString()};groups.push(g);save(files.groups,groups);res.json({ok:true,group:g,message:groupJid?'Grupo vinculado com sucesso.':'Grupo salvo. Será vinculado quando o WhatsApp estiver conectado.'})}catch(e){res.status(400).json({error:e.message})}});
 app.get('/api/whatsapp/status',(req,res)=>{const x=wa.get(req.user.id)||{};res.json({state:x.state||'disconnected',connected:x.state==='connected',qrAvailable:Boolean(x.qr),groups:groups.filter(g=>g.userId===req.user.id).length,lastError:x.lastError||null})});
 app.get('/api/whatsapp/qr',async(req,res)=>{const x=wa.get(req.user.id);if(!x?.qr)return res.status(404).json({error:'QR ainda não disponível'});res.json({ok:true,qr:x.qr})});
-async function startWA(uid,opts={}){let x=wa.get(uid)||{state:'disconnected'};if(x.state==='connecting'||x.state==='connected')return x;const dir=path.join(AUTH_ROOT,uid);fs.mkdirSync(dir,{recursive:true});x={state:'connecting',qr:null,pairingCode:null,lastError:null};wa.set(uid,x);const {state,saveCreds}=await useMultiFileAuthState(dir);const {version}=await fetchLatestBaileysVersion();const sock=makeWASocket({version,logger:pino({level:'silent'}),auth:{creds:state.creds,keys:makeCacheableSignalKeyStore(state.keys,pino({level:'silent'}))},printQRInTerminal:false,browser:['OfertaZap','Chrome','1.0.0']});x.sock=sock;sock.ev.on('creds.update',saveCreds);sock.ev.on('connection.update',async({connection,lastDisconnect,qr})=>{if(qr&&!opts.pairing)x.qr=await QRCode.toDataURL(qr);if(connection==='open'){x.state='connected';x.qr=null;x.pairingCode=null;x.lastError=null;try{const all=await sock.groupFetchAllParticipating();const own=groups.filter(g=>g.userId===uid);for(const [jid,g] of Object.entries(all)){let item=own.find(z=>z.jid===jid);if(item){item.name=item.name||g.subject||jid;item.status='connected';item.enabled=true}else{item={id:crypto.randomUUID(),userId:uid,name:g.subject||jid,jid,inviteLink:'',enabled:true,status:'connected'};groups.push(item)}}for(const item of own.filter(g=>!g.jid&&g.inviteLink)){try{const code=extractInviteCode(item.inviteLink);if(!code)continue;const info=await sock.groupGetInviteInfo(code);item.jid=info.id;item.name=item.name||info.subject||'Grupo WhatsApp';item.status='connected'}catch{}}save(files.groups,groups)}catch{};log('whatsapp_connected',uid)}if(connection==='close'){x.state='disconnected';x.qr=null;x.pairingCode=null;x.lastError=String(new Boom(lastDisconnect?.error)?.output?.statusCode||lastDisconnect?.error?.message||'Conexão encerrada');if(Number(new Boom(lastDisconnect?.error)?.output?.statusCode)!==DisconnectReason.loggedOut)setTimeout(()=>startWA(uid).catch(()=>{}),5000)}});return x}
+const waReconnectTimers=new Map();
+function clearWAReconnect(uid){const t=waReconnectTimers.get(uid);if(t){clearTimeout(t);waReconnectTimers.delete(uid)}}
+function scheduleWAReconnect(uid,delay=5000){clearWAReconnect(uid);const timer=setTimeout(async()=>{waReconnectTimers.delete(uid);try{await startWA(uid)}catch(e){console.error('WA_RECONNECT',uid,e.message);scheduleWAReconnect(uid,10000)}},delay);waReconnectTimers.set(uid,timer)}
+async function startWA(uid,opts={}){
+  let x=wa.get(uid)||{state:'disconnected'};
+  if(x.state==='connecting'||x.state==='connected')return x;
+  clearWAReconnect(uid);
+  const dir=path.join(AUTH_ROOT,uid);
+  fs.mkdirSync(dir,{recursive:true});
+  x={state:'connecting',qr:null,pairingCode:null,lastError:null,sock:null,sessionId:crypto.randomUUID()};
+  wa.set(uid,x);
+  try{
+    const {state,saveCreds}=await useMultiFileAuthState(dir);
+    const {version}=await fetchLatestBaileysVersion();
+    const sock=makeWASocket({version,logger:pino({level:'silent'}),auth:{creds:state.creds,keys:makeCacheableSignalKeyStore(state.keys,pino({level:'silent'}))},printQRInTerminal:false,browser:['OfertaZap','Chrome','1.0.0']});
+    x.sock=sock;
+    sock.ev.on('creds.update',saveCreds);
+    sock.ev.on('connection.update',async({connection,lastDisconnect,qr})=>{
+      if(wa.get(uid)!==x)return;
+      if(qr&&!opts.pairing)x.qr=await QRCode.toDataURL(qr);
+      if(connection==='open'){
+        clearWAReconnect(uid);
+        x.state='connected';
+        x.qr=null;
+        x.pairingCode=null;
+        x.lastError=null;
+        try{
+          const all=await sock.groupFetchAllParticipating();
+          const own=groups.filter(g=>g.userId===uid);
+          for(const [jid,g] of Object.entries(all)){
+            let item=own.find(z=>z.jid===jid);
+            if(item){item.name=item.name||g.subject||jid;item.status='connected';item.enabled=true}
+            else{item={id:crypto.randomUUID(),userId:uid,name:g.subject||jid,jid,inviteLink:'',enabled:true,status:'connected'};groups.push(item)}
+          }
+          for(const item of own.filter(g=>!g.jid&&g.inviteLink)){
+            try{
+              const code=extractInviteCode(item.inviteLink);
+              if(!code)continue;
+              const info=await sock.groupGetInviteInfo(code);
+              item.jid=info.id;
+              item.name=item.name||info.subject||'Grupo WhatsApp';
+              item.status='connected'
+            }catch{}
+          }
+          save(files.groups,groups)
+        }catch{}
+        log('whatsapp_connected',uid)
+      }
+      if(connection==='close'){
+        const statusCode=Number(new Boom(lastDisconnect?.error)?.output?.statusCode);
+        x.state='disconnected';
+        x.qr=null;
+        x.pairingCode=null;
+        x.sock=null;
+        x.lastError=String(statusCode||lastDisconnect?.error?.message||'Conexão encerrada');
+        if(statusCode!==DisconnectReason.loggedOut)scheduleWAReconnect(uid,5000);
+      }
+    });
+    return x;
+  }catch(e){
+    if(wa.get(uid)===x){
+      x.state='disconnected';
+      x.sock=null;
+      x.lastError=String(e?.message||e||'Falha ao iniciar WhatsApp');
+      scheduleWAReconnect(uid,5000);
+    }
+    throw e;
+  }
+}
 function cleanPhone(v){return String(v||'').replace(/\D/g,'')}
 app.get('/api/whatsapp/status',(req,res)=>{const x=wa.get(req.user.id)||{};res.json({state:x.state||'disconnected',connected:x.state==='connected',qrAvailable:Boolean(x.qr),pairingAvailable:x.state==='connecting'||x.state==='disconnected',groups:groups.filter(g=>g.userId===req.user.id).length,lastError:x.lastError||null,authPersistent:fs.existsSync(path.join(AUTH_ROOT,req.user.id,'creds.json'))})});
 app.get('/api/whatsapp/qr',async(req,res)=>{const x=wa.get(req.user.id);if(!x?.qr)return res.status(404).json({error:'QR ainda não disponível. Se a sessão já estiver salva, não é necessário QR.'});res.json({ok:true,qr:x.qr})});
 app.post('/api/whatsapp/pairing-code',async(req,res)=>{try{const phone=cleanPhone(req.body?.phone);if(!/^55?\d{10,13}$/.test(phone))throw Error('Informe o número com DDI. Ex.: 5566999999999');let x=wa.get(req.user.id);if(x?.state==='connected')return res.json({ok:true,connected:true,message:'WhatsApp já está conectado.'});if(!x||x.state!=='connecting')x=await startWA(req.user.id,{pairing:true});const code=await x.sock.requestPairingCode(phone);x.pairingCode=code;res.json({ok:true,code,state:x.state})}catch(e){res.status(400).json({error:e.message})}});
-app.post('/api/whatsapp/restart-session',async(req,res)=>{try{const uid=req.user.id,x=wa.get(uid);try{await x?.sock?.logout()}catch{};wa.delete(uid);const dir=path.join(AUTH_ROOT,uid);fs.rmSync(dir,{recursive:true,force:true});await startWA(uid);res.json({ok:true,state:wa.get(uid)?.state||'connecting',qrAvailable:Boolean(wa.get(uid)?.qr)})}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/whatsapp/restart-session',async(req,res)=>{try{const uid=req.user.id,x=wa.get(uid);clearWAReconnect(uid);try{await x?.sock?.logout()}catch{};wa.delete(uid);const dir=path.join(AUTH_ROOT,uid);fs.rmSync(dir,{recursive:true,force:true});await startWA(uid);res.json({ok:true,state:wa.get(uid)?.state||'connecting',qrAvailable:Boolean(wa.get(uid)?.qr)})}catch(e){res.status(400).json({error:e.message})}});
 app.post('/api/whatsapp/start',async(req,res)=>{try{const x=await startWA(req.user.id);res.json({ok:true,state:x.state,qrAvailable:Boolean(x.qr)})}catch(e){res.status(400).json({error:e.message})}});
-app.post('/api/whatsapp/disconnect',async(req,res)=>{const x=wa.get(req.user.id);try{await x?.sock?.logout()}catch{};if(x)x.state='disconnected';res.json({ok:true})});
+app.post('/api/whatsapp/disconnect',async(req,res)=>{const uid=req.user.id,x=wa.get(uid);clearWAReconnect(uid);try{await x?.sock?.logout()}catch{};if(x){x.state='disconnected';x.sock=null}res.json({ok:true})});
 
 function renderMsg(t,p){return String(t||'').replaceAll('{produto}',p.name||'Produto').replaceAll('{preco}',money(p.price)).replaceAll('{preco_antigo}',money(p.oldPrice)).replaceAll('{desconto}',p.discount||discount(Number(p.oldPrice),Number(p.price))||'').replaceAll('{link}',p.link||'')}
 app.get('/api/jobs',(req,res)=>res.json({jobs:jobs.filter(j=>j.userId===req.user.id),quota:quota(req.user.id)}));
@@ -136,4 +204,3 @@ await initPersistence();
 ensureMaster();
 if(pool) await persistState();
 app.listen(PORT,'0.0.0.0',()=>{console.log(`OfertaZap SaaS V38 na porta ${PORT}`);console.log(`DATA_DIR=${ROOT}`);console.log(`AUTH_ROOT=${AUTH_ROOT}`);console.log(`POSTGRES=${pool?'connected':'not configured'}`);for(const u of db.users.filter(x=>x.role==='CLIENT'&&x.active!==false)){if(activeSub(u.id))startWA(u.id).catch(e=>console.error('WA',u.id,e.message))}});
-
